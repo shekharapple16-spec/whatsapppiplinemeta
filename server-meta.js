@@ -17,7 +17,7 @@ const GEMINI_API_KEY       = process.env.GEMINI_API_KEY;
 const BOT_WEBHOOK_URL      = process.env.BOT_WEBHOOK_URL;   // your Render URL e.g. https://your-bot.onrender.com
 const BOT_WEBHOOK_SECRET   = process.env.BOT_WEBHOOK_SECRET; // random secret shared with GitHub Actions
 
-const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`;
+const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp:generateContent?key=${GEMINI_API_KEY}`;
 
 // ─── Repo Config ──────────────────────────────────────────────────
 const REPOS = [
@@ -133,16 +133,7 @@ app.post("/ai-fix-callback", async (req, res) => {
     res.sendStatus(200); // respond immediately so Actions doesn't timeout
 
     // Notify user the agent results arrived
-    await send(phone,
-      `📦 *Playwright Agent Results Received — Issue #${issueNumber}*\n\n` +
-      `✅ Real test run complete in GitHub Actions!\n\n` +
-      `📊 *Agent captured:*\n` +
-      `  ${artifacts?.screenshotBase64 ? "📸 Screenshot (actual page state)" : "⚠️ No screenshot"}\n` +
-      `  ${artifacts?.domSnapshot ? "🖥️ DOM snapshot (live page structure)" : "⚠️ No DOM snapshot"}\n` +
-      `  📁 Source files: ${Object.keys(sourceFiles || {}).length} files read\n` +
-      `  ❌ Error: ${testResult?.error?.slice(0, 100) || "captured"}\n\n` +
-      `🧠 Sending all context to Gemini for fix analysis...\n⏳ Writing fix now...`
-    );
+    await send(phone, `🧠 Analysing and writing fix for issue #${issueNumber}...`);
 
     // Now call Gemini with the REAL context from the Playwright agent
     const repo = getLastRepo(phone) || REPOS[0];
@@ -250,20 +241,27 @@ If you cannot determine a safe fix from the available data, return:
       };
     }
 
-    const geminiRes = await axios.post(GEMINI_URL, geminiPayload);
+    // Gemini call with retry on 429
+    let geminiRes;
+    for (let attempt = 0; attempt < 4; attempt++) {
+      try {
+        geminiRes = await axios.post(GEMINI_URL, geminiPayload);
+        break;
+      } catch (err) {
+        if (err.response?.status === 429 && attempt < 3) {
+          const wait = (attempt + 1) * 15000;
+          console.log(`⏳ Gemini 429 — retrying in ${wait/1000}s (attempt ${attempt + 1})`);
+          await new Promise(r => setTimeout(r, wait));
+        } else { throw err; }
+      }
+    }
     let raw = geminiRes.data.candidates[0].content.parts[0].text.trim();
     raw = raw.replace(/^```json\s*/i, "").replace(/^```\s*/i, "").replace(/```$/i, "").trim();
-
     const geminiResult = JSON.parse(raw);
     console.log(`🧠 Gemini fix: "${geminiResult.prTitle}" | ${geminiResult.fixes?.length || 0} file(s)`);
 
     if (!geminiResult?.fixes?.length) {
-      await send(phone,
-        `⚠️ *Gemini could not determine a safe fix for Issue #${issueNumber}*\n\n` +
-        `Reason: ${geminiResult?.explanation || "Unknown"}\n\n` +
-        `The Playwright agent data has been uploaded to GitHub Actions for manual review:\n` +
-        `🔗 ${runUrl}`
-      );
+      await send(phone, `⚠️ Could not auto-fix issue #${issueNumber}.\nReason: ${geminiResult?.explanation || "Unknown"}\n🔗 ${runUrl}`);
       return;
     }
 
@@ -310,14 +308,10 @@ If you cannot determine a safe fix from the available data, return:
 
     if (githubCache[repo.repo]) githubCache[repo.repo].updatedAt = 0;
 
-    // Final WhatsApp message
     await send(phone,
-      `✅ *AI Fix Complete — Issue #${issueNumber}*\n\n` +
-      `🎯 *Root cause (from real browser run):*\n${geminiResult.rootCause}\n\n` +
-      `🧠 *What Gemini fixed:*\n${geminiResult.explanation}\n\n` +
-      `📝 *Files changed:*\n${geminiResult.fixes.map(f => `• \`${f.path}\``).join("\n")}\n\n` +
-      `🔀 *PR #${pr.number}:*\n${pr.html_url}\n\n` +
-      `👨‍💻 Review the PR, then say:\n*"execute PR #${pr.number}"* to verify the fix.`
+      `✅ *Issue #${issueNumber} fixed!*\n\n` +
+      `🔀 PR #${pr.number}: ${pr.html_url}\n\n` +
+      `Say *"execute PR #${pr.number}"* to verify.`
     );
 
   } catch (err) {
@@ -418,7 +412,7 @@ async function startTestRun(fromPhone, repo) {
   const trackedRunId = runsRes.workflow_runs[0]?.id;
   if (!trackedRunId) { await send(fromPhone, "❌ Could not find the triggered run."); return; }
 
-  await send(fromPhone, `🔄 Polling...\n🔗 https://github.com/${repo.repo}/actions/runs/${trackedRunId}`);
+  // polling silently
 
   let attempt = 0;
   while (true) {
@@ -474,7 +468,7 @@ async function handleCreateIssues(fromPhone) {
   const { summary, repoName, runUrl, repo } = report;
   if (!summary.failedTests?.length) { await send(fromPhone, `🎉 No failed tests in *${repoName}*! ✅`); return; }
 
-  await send(fromPhone, `🔍 Checking existing issues before creating new ones...`);
+  // checking existing issues silently
 
   const openIssues    = await ghGet(`/repos/${repo.repo}/issues?state=open&per_page=100`);
   const alreadyExists = [];
@@ -541,7 +535,7 @@ async function handleFixIssue(fromPhone, issueNumber) {
   if (!repo) { await send(fromPhone, `⚠️ I don't know which repo to use. Run tests first.`); return; }
   if (!issueNumber) { await send(fromPhone, `⚠️ Include the issue number. Example: *"fix issue #12"*`); return; }
 
-  await send(fromPhone, `🔍 Fetching issue #${issueNumber}...`);
+  // fetching issue silently
 
   let issue;
   try {
@@ -555,21 +549,7 @@ async function handleFixIssue(fromPhone, issueNumber) {
   const testTitle = issue.title.replace("🐛 [Playwright] ", "").trim();
   const testFile  = extractFileFromIssueBody(issue.body) || "tests/";
 
-  await send(fromPhone,
-    `🤖 *AI Fix Agent Starting — Issue #${issueNumber}*\n\n` +
-    `📋 *${issue.title}*\n\n` +
-    `🎭 *Playwright Agent will now:*\n` +
-    `  1️⃣ Run the real failing test in GitHub Actions\n` +
-    `  2️⃣ Capture screenshot of actual page state\n` +
-    `  3️⃣ Capture live DOM snapshot (real selectors)\n` +
-    `  4️⃣ Read all source + page object files\n` +
-    `  5️⃣ Send everything back here\n\n` +
-    `  Then Gemini will:\n` +
-    `  6️⃣ Analyse error + real DOM + screenshot\n` +
-    `  7️⃣ Write a precise fix (not a guess!)\n` +
-    `  8️⃣ Create branch + commit + open PR\n\n` +
-    `⏳ Triggering GitHub Actions agent now...`
-  );
+  await send(fromPhone, `🔧 Fixing issue #${issueNumber}...`);
 
   // Trigger the AI Fix Agent workflow
   try {
@@ -589,13 +569,7 @@ async function handleFixIssue(fromPhone, issueNumber) {
 
     console.log(`✅ AI Fix Agent triggered for issue #${issueNumber}`);
 
-    await send(fromPhone,
-      `✅ *Playwright Agent triggered!*\n\n` +
-      `GitHub Actions is now running the real test with full browser...\n\n` +
-      `⏳ This takes ~3-5 minutes.\n` +
-      `I'll message you automatically when Gemini's fix is ready!\n\n` +
-      `🔗 Watch live: https://github.com/${repo.repo}/actions`
-    );
+    await send(fromPhone, `⏳ Working on fix for issue #${issueNumber}... I'll send you the PR link when ready.`);
 
   } catch (err) {
     console.error("❌ Could not trigger AI Fix workflow:", err.message);
@@ -616,7 +590,7 @@ async function handleExecutePR(fromPhone, prNumber) {
   if (!repo)    { await send(fromPhone, `⚠️ Run tests first so I know which repo.`); return; }
   if (!prNumber){ await send(fromPhone, `⚠️ Include PR number. Example: *"execute PR #3"*`); return; }
 
-  await send(fromPhone, `🔍 Fetching PR #${prNumber}...`);
+  // fetching PR silently
 
   let pr;
   try {
@@ -628,12 +602,7 @@ async function handleExecutePR(fromPhone, prNumber) {
 
   const prBranch = pr.head.ref;
 
-  await send(fromPhone,
-    `🧪 *Executing PR #${prNumber} — ${repo.name}*\n\n` +
-    `📋 *${pr.title}*\n` +
-    `🌿 Branch: \`${prBranch}\`\n\n` +
-    `Triggering Playwright on the PR branch...\n⏳ Polling for results...`
-  );
+  await send(fromPhone, `🧪 Running tests for PR #${prNumber}... I'll send the result when done.`);
 
   // Trigger workflow on the PR branch
   try {
