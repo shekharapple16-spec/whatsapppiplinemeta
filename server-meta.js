@@ -5,7 +5,7 @@ import axios from "axios";
 dotenv.config();
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: "50mb" })); // large — screenshots come back as base64
 app.use(express.urlencoded({ extended: false }));
 
 // ─── Credentials ──────────────────────────────────────────────────
@@ -14,7 +14,10 @@ const META_API_TOKEN       = process.env.META_API_TOKEN;
 const WEBHOOK_VERIFY_TOKEN = process.env.WEBHOOK_VERIFY_TOKEN;
 const GITHUB_TOKEN         = process.env.GITHUB_TOKEN;
 const GEMINI_API_KEY       = process.env.GEMINI_API_KEY;
-const GEMINI_URL           = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`;
+const BOT_WEBHOOK_URL      = process.env.BOT_WEBHOOK_URL;   // your Render URL e.g. https://your-bot.onrender.com
+const BOT_WEBHOOK_SECRET   = process.env.BOT_WEBHOOK_SECRET; // random secret shared with GitHub Actions
+
+const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`;
 
 // ─── Repo Config ──────────────────────────────────────────────────
 const REPOS = [
@@ -23,7 +26,8 @@ const REPOS = [
     name: "HCL Playwright",
     keywords: ["hcl", "playwright", "aspire", "1"],
     repo: "shekharapple16-spec/hclplaywrightaspire",
-    workflow: "207958236",
+    workflow: "207958236",           // main test workflow ID
+    aiFixWorkflow: "ai-fix.yml",     // the new AI agent workflow
     branch: "master",
   },
   {
@@ -32,6 +36,7 @@ const REPOS = [
     keywords: ["repo2", "two", "second", "2"],
     repo: "your-username/your-repo-2",
     workflow: "playwright.yml",
+    aiFixWorkflow: "ai-fix.yml",
     branch: "main",
   },
   {
@@ -40,20 +45,26 @@ const REPOS = [
     keywords: ["repo3", "three", "third", "3"],
     repo: "your-username/your-repo-3",
     workflow: "playwright.yml",
+    aiFixWorkflow: "ai-fix.yml",
     branch: "main",
   },
 ];
 
 // ─── In-memory store ──────────────────────────────────────────────
-const chatHistory = {};  // { phone: [{role, text}] }
-const sessions    = {};  // { phone: { state, action, pendingQuestion } }
-const lastReports = {};  // { phone: { repo, repoName, summary, runUrl, conclusion, fetchedAt } }
-const githubCache = {};  // { repoFullName: { issues, prs, commits, branches, workflows, repoInfo, updatedAt } }
+const chatHistory = {};
+const sessions    = {};
+const lastReports = {};
+const githubCache = {};
+
+// Pending fix contexts: { issueNumber_repoSlug: { phone, repo, issue, ... } }
+// We store them while waiting for GitHub Actions to call back
+const pendingFixes = {};
+
 const MAX_HISTORY = 20;
-const CACHE_TTL   = 5 * 60 * 1000; // 5 minutes
+const CACHE_TTL   = 5 * 60 * 1000;
 
 // ════════════════════════════════════════════════════════════════════
-//  WEBHOOK
+//  WEBHOOK — WhatsApp
 // ════════════════════════════════════════════════════════════════════
 
 app.get("/webhook", (req, res) => {
@@ -86,14 +97,243 @@ app.post("/webhook", async (req, res) => {
 });
 
 // ════════════════════════════════════════════════════════════════════
-//  MAIN HANDLER
+//  AI FIX CALLBACK — GitHub Actions posts results here
+//  This is the core of the Playwright Agent integration:
+//  GitHub Actions ran the real test, captured screenshot + DOM + error,
+//  and now sends it all here so Gemini can write a real fix
+// ════════════════════════════════════════════════════════════════════
+
+app.post("/ai-fix-callback", async (req, res) => {
+  try {
+    // Verify secret
+    const secret = req.headers["x-bot-secret"];
+    if (secret !== BOT_WEBHOOK_SECRET) {
+      console.warn("⚠️ Invalid bot secret on /ai-fix-callback");
+      return res.sendStatus(403);
+    }
+
+    const {
+      phone,
+      issueNumber,
+      testTitle,
+      testFile,
+      runUrl,
+      testResult,    // { passed, error, failedTests }
+      artifacts,     // { screenshotBase64, domSnapshot, traceFiles }
+      sourceFiles,   // { 'tests/day3/login.spec.js': '...', 'pages/LoginPage.js': '...' }
+    } = req.body;
+
+    console.log(`\n🤖 AI Fix callback received — Issue #${issueNumber} for ${phone}`);
+    console.log(`   Test: ${testTitle}`);
+    console.log(`   Passed: ${testResult?.passed}`);
+    console.log(`   Screenshot: ${artifacts?.screenshotBase64?.length > 0 ? "YES" : "NO"}`);
+    console.log(`   DOM snapshot: ${artifacts?.domSnapshot?.length > 0 ? "YES" : "NO"}`);
+    console.log(`   Source files: ${Object.keys(sourceFiles || {}).join(", ")}`);
+
+    res.sendStatus(200); // respond immediately so Actions doesn't timeout
+
+    // Notify user the agent results arrived
+    await send(phone,
+      `📦 *Playwright Agent Results Received — Issue #${issueNumber}*\n\n` +
+      `✅ Real test run complete in GitHub Actions!\n\n` +
+      `📊 *Agent captured:*\n` +
+      `  ${artifacts?.screenshotBase64 ? "📸 Screenshot (actual page state)" : "⚠️ No screenshot"}\n` +
+      `  ${artifacts?.domSnapshot ? "🖥️ DOM snapshot (live page structure)" : "⚠️ No DOM snapshot"}\n` +
+      `  📁 Source files: ${Object.keys(sourceFiles || {}).length} files read\n` +
+      `  ❌ Error: ${testResult?.error?.slice(0, 100) || "captured"}\n\n` +
+      `🧠 Sending all context to Gemini for fix analysis...\n⏳ Writing fix now...`
+    );
+
+    // Now call Gemini with the REAL context from the Playwright agent
+    const repo = getLastRepo(phone) || REPOS[0];
+    await writeFixAndCreatePR(phone, repo, issueNumber, testTitle, testFile, testResult, artifacts, sourceFiles, runUrl);
+
+  } catch (err) {
+    console.error("❌ ai-fix-callback error:", err.message);
+  }
+});
+
+// ════════════════════════════════════════════════════════════════════
+//  CORE: Gemini writes fix from REAL Playwright agent data → PR
+// ════════════════════════════════════════════════════════════════════
+
+async function writeFixAndCreatePR(phone, repo, issueNumber, testTitle, testFile, testResult, artifacts, sourceFiles, runUrl) {
+  try {
+    // Build source context for Gemini
+    const sourceCtx = Object.entries(sourceFiles || {})
+      .map(([path, content]) => `FILE: ${path}\n\`\`\`javascript\n${content.slice(0, 3000)}\n\`\`\``)
+      .join("\n\n");
+
+    // Build DOM context
+    const domCtx = artifacts?.domSnapshot
+      ? `DOM SNAPSHOT (actual page HTML when test failed):\n\`\`\`html\n${artifacts.domSnapshot.slice(0, 6000)}\n\`\`\``
+      : "No DOM snapshot available.";
+
+    // Screenshot note — Gemini 2.5 Flash supports image input
+    // We include it if available
+    const hasScreenshot = artifacts?.screenshotBase64?.length > 100;
+
+    const prompt = `You are an expert Playwright test automation engineer.
+
+A GitHub Actions Playwright agent has just run the REAL failing test in a live browser and captured the following data. Use this REAL data (not guesses) to write a precise fix.
+
+════════════════════════════════════
+FAILING TEST
+════════════════════════════════════
+Title : "${testTitle}"
+File  : ${testFile}
+Error :
+${testResult?.error || testResult?.failedTests?.[0]?.error || "No error captured"}
+
+Run URL: ${runUrl}
+
+════════════════════════════════════
+SOURCE FILES (read directly from repo)
+════════════════════════════════════
+${sourceCtx || "No source files available."}
+
+════════════════════════════════════
+LIVE DOM SNAPSHOT (actual page state when test failed)
+Use this to check if selectors in the test match the real page structure.
+Look for: correct element IDs, class names, roles, text content.
+════════════════════════════════════
+${domCtx}
+
+${hasScreenshot ? "A screenshot of the page at failure time has been captured (attached as image)." : ""}
+
+════════════════════════════════════
+INSTRUCTIONS
+════════════════════════════════════
+1. Compare selectors in the test file against the REAL DOM above
+2. Identify the exact root cause (wrong selector? timing? missing await? wrong assertion?)
+3. Write the COMPLETE fixed file content — not a diff, the full file
+4. Only change what is necessary — minimal targeted fix
+5. Check page objects in pages/ — the fix may need to go there instead of the test
+
+Respond ONLY with valid JSON (no markdown fences, no extra text):
+{
+  "prTitle": "fix: <short description of what was wrong>",
+  "explanation": "<3-4 sentences: exactly what was wrong based on the real DOM/error, and what you changed>",
+  "rootCause": "<one sentence root cause>",
+  "fixes": [
+    {
+      "path": "relative/path/to/file.js",
+      "message": "fix: <what changed in this file>",
+      "content": "<COMPLETE file content with fix applied>"
+    }
+  ]
+}
+
+If you cannot determine a safe fix from the available data, return:
+{ "fixes": [], "explanation": "<reason>", "prTitle": "", "rootCause": "" }`;
+
+    // Call Gemini — include screenshot as image if available
+    let geminiPayload;
+    if (hasScreenshot) {
+      // Gemini 2.5 Flash supports multimodal — send text + image
+      geminiPayload = {
+        contents: [{
+          parts: [
+            { text: prompt },
+            {
+              inline_data: {
+                mime_type: "image/png",
+                data: artifacts.screenshotBase64,
+              }
+            }
+          ]
+        }]
+      };
+    } else {
+      geminiPayload = {
+        contents: [{ parts: [{ text: prompt }] }]
+      };
+    }
+
+    const geminiRes = await axios.post(GEMINI_URL, geminiPayload);
+    let raw = geminiRes.data.candidates[0].content.parts[0].text.trim();
+    raw = raw.replace(/^```json\s*/i, "").replace(/^```\s*/i, "").replace(/```$/i, "").trim();
+
+    const geminiResult = JSON.parse(raw);
+    console.log(`🧠 Gemini fix: "${geminiResult.prTitle}" | ${geminiResult.fixes?.length || 0} file(s)`);
+
+    if (!geminiResult?.fixes?.length) {
+      await send(phone,
+        `⚠️ *Gemini could not determine a safe fix for Issue #${issueNumber}*\n\n` +
+        `Reason: ${geminiResult?.explanation || "Unknown"}\n\n` +
+        `The Playwright agent data has been uploaded to GitHub Actions for manual review:\n` +
+        `🔗 ${runUrl}`
+      );
+      return;
+    }
+
+    // Create branch + commit + PR
+    const headers = {
+      Authorization:          `token ${GITHUB_TOKEN}`,
+      "X-GitHub-Api-Version": "2022-11-28",
+      "Content-Type":         "application/json",
+    };
+
+    const branchSHA = await getDefaultBranchSHA(repo, headers);
+    if (!branchSHA) {
+      await send(phone, `❌ Could not read branch SHA. Check GITHUB_TOKEN permissions.`);
+      return;
+    }
+
+    const safeName   = testTitle.replace(/[^a-zA-Z0-9]/g, "-").slice(0, 40).toLowerCase();
+    const branchName = `ai-fix-issue-${issueNumber}-${safeName}`;
+
+    await createBranch(repo, branchName, branchSHA, headers);
+
+    for (const fix of geminiResult.fixes) {
+      await commitFile(repo, branchName, fix.path, fix.content, fix.message, headers);
+      console.log(`  📝 Committed: ${fix.path}`);
+    }
+
+    const prBody = buildPRBody(issueNumber, testTitle, testFile, testResult?.error, geminiResult, runUrl, artifacts);
+    const pr     = await createPR(repo, branchName, repo.branch, geminiResult.prTitle, prBody, headers);
+    console.log(`✅ PR #${pr.number}: ${pr.html_url}`);
+
+    // Comment on the issue linking to PR
+    await ghPost(`/repos/${repo.repo}/issues/${issueNumber}/comments`, {
+      body:
+        `## 🤖 AI Fix Raised\n\n` +
+        `The Playwright agent ran the real test in GitHub Actions and captured:\n` +
+        `- 📸 Screenshot of page at failure\n` +
+        `- 🖥️ Live DOM snapshot\n` +
+        `- ❌ Exact error message\n\n` +
+        `Gemini analysed this real data and opened a fix PR.\n\n` +
+        `**Root cause:** ${geminiResult.rootCause}\n\n` +
+        `**PR:** ${pr.html_url}\n\n` +
+        `*Auto-actioned by WhatsApp QA Bot + Playwright Agent 🤖*`,
+    });
+
+    if (githubCache[repo.repo]) githubCache[repo.repo].updatedAt = 0;
+
+    // Final WhatsApp message
+    await send(phone,
+      `✅ *AI Fix Complete — Issue #${issueNumber}*\n\n` +
+      `🎯 *Root cause (from real browser run):*\n${geminiResult.rootCause}\n\n` +
+      `🧠 *What Gemini fixed:*\n${geminiResult.explanation}\n\n` +
+      `📝 *Files changed:*\n${geminiResult.fixes.map(f => `• \`${f.path}\``).join("\n")}\n\n` +
+      `🔀 *PR #${pr.number}:*\n${pr.html_url}\n\n` +
+      `👨‍💻 Review the PR, then say:\n*"execute PR #${pr.number}"* to verify the fix.`
+    );
+
+  } catch (err) {
+    console.error("❌ writeFixAndCreatePR error:", err.message);
+    await send(phone, `❌ Something went wrong writing the fix: ${err.message}`);
+  }
+}
+
+// ════════════════════════════════════════════════════════════════════
+//  MAIN MESSAGE HANDLER
 // ════════════════════════════════════════════════════════════════════
 
 async function handleMessage(fromPhone, message) {
   const lower   = message.toLowerCase().trim();
   const session = sessions[fromPhone] || {};
 
-  // ── Utility commands ──
   if (lower === "clear" || lower === "reset") {
     chatHistory[fromPhone] = [];
     sessions[fromPhone]    = {};
@@ -109,79 +349,56 @@ async function handleMessage(fromPhone, message) {
   // ── Awaiting repo selection ──
   if (session.state === "awaiting_repo") {
     const repo = resolveRepo(message);
-    if (!repo) {
-      await send(fromPhone, `❓ Couldn't find that repo.\n\n${buildRepoMenu()}`);
-      return;
-    }
-    const action = session.action;
+    if (!repo) { await send(fromPhone, `❓ Couldn't find that repo.\n\n${buildRepoMenu()}`); return; }
     sessions[fromPhone] = {};
-
-    if (action === "run_tests") {
-      await startTestRun(fromPhone, repo);
-    } else if (action === "general") {
-      await answerGeneralQuery(fromPhone, repo, session.pendingQuestion);
-    }
+    if (session.action === "run_tests")  { await startTestRun(fromPhone, repo); return; }
+    if (session.action === "general")    { await answerGeneralQuery(fromPhone, repo, session.pendingQuestion); return; }
     return;
   }
 
-  // ── Detect intent ──
   const intent = await detectIntent(message);
-  console.log(`🤖 Intent: ${intent}`);
+  console.log(`🤖 Intent: ${intent} | Message: "${message}"`);
 
-  // ─────────────────────────────────────────────────────────────────
-  // INTENT: run tests
-  // ─────────────────────────────────────────────────────────────────
+  // ─── INTENT: run tests ────────────────────────────────────────
   if (intent === "run_tests") {
     const repo = detectRepo(message) || getLastRepo(fromPhone);
-    if (!repo) {
-      sessions[fromPhone] = { state: "awaiting_repo", action: "run_tests" };
-      await send(fromPhone, `🚀 Which repo?\n\n${buildRepoMenu()}`);
-      return;
-    }
+    if (!repo) { sessions[fromPhone] = { state: "awaiting_repo", action: "run_tests" }; await send(fromPhone, `🚀 Which repo?\n\n${buildRepoMenu()}`); return; }
     await startTestRun(fromPhone, repo);
     return;
   }
 
-  // ─────────────────────────────────────────────────────────────────
-  // INTENT: create issues  (checks existing first)
-  // ─────────────────────────────────────────────────────────────────
+  // ─── INTENT: create issues ────────────────────────────────────
   if (intent === "create_issues") {
     await handleCreateIssues(fromPhone);
     return;
   }
 
-  // ─────────────────────────────────────────────────────────────────
-  // INTENT: fix issue #N  →  LLM reads code → creates PR
-  // ─────────────────────────────────────────────────────────────────
+  // ─── INTENT: fix issue #N ─────────────────────────────────────
   if (intent === "fix_issue") {
-    const issueNum = extractIssueNumber(message);
+    const issueNum = extractNumber(message);
     await handleFixIssue(fromPhone, issueNum);
     return;
   }
 
-  // ─────────────────────────────────────────────────────────────────
-  // INTENT: execute PR #N  →  triggers workflow on PR branch → result
-  // ─────────────────────────────────────────────────────────────────
+  // ─── INTENT: execute PR #N ────────────────────────────────────
   if (intent === "execute_pr") {
-    const prNum = extractPRNumber(message);
+    const prNum = extractNumber(message);
     await handleExecutePR(fromPhone, prNum);
     return;
   }
 
-  // ─────────────────────────────────────────────────────────────────
-  // INTENT: general query  →  live GitHub context + Gemini answer
-  // ─────────────────────────────────────────────────────────────────
+  // ─── GENERAL: answer any repo question ───────────────────────
   const repo = detectRepo(message) || getLastRepo(fromPhone);
   if (!repo) {
     sessions[fromPhone] = { state: "awaiting_repo", action: "general", pendingQuestion: message };
-    await send(fromPhone, `📂 Which repo are you asking about?\n\n${buildRepoMenu()}`);
+    await send(fromPhone, `📂 Which repo?\n\n${buildRepoMenu()}`);
     return;
   }
   await answerGeneralQuery(fromPhone, repo, message);
 }
 
 // ════════════════════════════════════════════════════════════════════
-//  STEP 1 — RUN TESTS → minimal summary report
+//  STEP 1 — RUN TESTS → minimal report
 // ════════════════════════════════════════════════════════════════════
 
 async function startTestRun(fromPhone, repo) {
@@ -195,20 +412,14 @@ async function startTestRun(fromPhone, repo) {
     return;
   }
 
-  // Wait for GitHub to register the run
   await sleep(12000);
 
-  // Get the run we just triggered
   const runsRes      = await ghGet(`/repos/${repo.repo}/actions/runs?per_page=1`);
   const trackedRunId = runsRes.workflow_runs[0]?.id;
-  if (!trackedRunId) {
-    await send(fromPhone, "❌ Could not find the triggered run. Check GitHub Actions.");
-    return;
-  }
+  if (!trackedRunId) { await send(fromPhone, "❌ Could not find the triggered run."); return; }
 
-  await send(fromPhone, `🔄 Run started. Polling...\n🔗 https://github.com/${repo.repo}/actions/runs/${trackedRunId}`);
+  await send(fromPhone, `🔄 Polling...\n🔗 https://github.com/${repo.repo}/actions/runs/${trackedRunId}`);
 
-  // Poll until complete
   let attempt = 0;
   while (true) {
     await sleep(30000);
@@ -218,48 +429,37 @@ async function startTestRun(fromPhone, repo) {
       console.log(`⏳ [${elapsed}m] ${run.status}/${run.conclusion || "running"}`);
 
       if (run.status === "completed") {
-        // Fetch JSON report artifact
         await ensureReportLoaded(fromPhone, repo);
         const report = lastReports[fromPhone];
-
-        // Send MINIMAL summary
         await send(fromPhone, buildMinimalReport(report, run.html_url));
         addHistory(fromPhone, "assistant", `Test run completed for ${repo.name}.`);
         return;
       }
-    } catch (e) {
-      console.error(`⚠️ Poll error (attempt ${attempt}):`, e.message);
-    }
+    } catch (e) { console.error(`⚠️ Poll error:`, e.message); }
     attempt++;
   }
 }
 
-// ─── Minimal report — just the numbers + list of failed/skipped ───
 function buildMinimalReport(report, runUrl) {
-  if (!report?.summary) {
-    return `⚠️ Could not load test report.\n🔗 ${runUrl}`;
-  }
+  if (!report?.summary) return `⚠️ Could not load report.\n🔗 ${runUrl}`;
   const s    = report.summary;
   const icon = s.failed === 0 ? "🟢" : "🔴";
-
-  let msg = `${icon} *${report.repoName} — Test Results*\n\n`;
+  let msg    = `${icon} *${report.repoName} — Results*\n\n`;
   msg += `✅ Passed : ${s.passed}\n`;
   msg += `❌ Failed : ${s.failed}\n`;
   msg += `⊝ Skipped: ${s.skipped}\n`;
   msg += `📈 Total  : ${s.total}\n`;
   msg += `⏱ Duration: ${s.duration}s\n`;
-
   if (s.failedTests?.length) {
-    msg += `\n*Failed tests:*\n`;
+    msg += `\n*Failed:*\n`;
     s.failedTests.forEach(t => { msg += `  • ${t.title}\n`; });
   }
   if (s.skippedTests?.length) {
-    msg += `\n*Skipped tests:*\n`;
+    msg += `\n*Skipped:*\n`;
     s.skippedTests.forEach(t => { msg += `  • ${t.title}\n`; });
   }
-
   msg += `\n🔗 ${runUrl}`;
-  msg += `\n\n💡 Ask me anything about the results, or:\n• "create issues for failed tests"\n• "fix issue #<number>"`;
+  msg += `\n\n💡 Ask anything, or:\n• "create issues for failed tests"\n• "fix issue #<number>"`;
   return msg;
 }
 
@@ -269,233 +469,155 @@ function buildMinimalReport(report, runUrl) {
 
 async function handleCreateIssues(fromPhone) {
   const report = lastReports[fromPhone];
-  if (!report?.summary) {
-    await send(fromPhone, `⚠️ No test report loaded yet. Say *"run tests"* first.`);
-    return;
-  }
+  if (!report?.summary) { await send(fromPhone, `⚠️ No report loaded. Say *"run tests"* first.`); return; }
 
   const { summary, repoName, runUrl, repo } = report;
+  if (!summary.failedTests?.length) { await send(fromPhone, `🎉 No failed tests in *${repoName}*! ✅`); return; }
 
-  if (!summary.failedTests?.length) {
-    await send(fromPhone, `🎉 No failed tests in *${repoName}* — nothing to create issues for! ✅`);
-    return;
-  }
+  await send(fromPhone, `🔍 Checking existing issues before creating new ones...`);
 
-  await send(fromPhone, `🔍 Checking existing GitHub issues before creating new ones...`);
-
-  // Fetch ALL open issues to check for duplicates
-  const openIssues = await ghGet(`/repos/${repo.repo}/issues?state=open&per_page=100`);
-
+  const openIssues    = await ghGet(`/repos/${repo.repo}/issues?state=open&per_page=100`);
   const alreadyExists = [];
   const toCreate      = [];
 
   for (const test of summary.failedTests) {
-    // Check if an issue already exists for this test (match by title)
     const existing = openIssues.find(issue => {
       const issueTitle = issue.title.toLowerCase().replace("🐛 [playwright] ", "").trim();
       const testTitle  = test.title.toLowerCase().trim();
       return issueTitle === testTitle || issueTitle.includes(testTitle) || testTitle.includes(issueTitle);
     });
-
-    if (existing) {
-      alreadyExists.push({ test: test.title, issue: existing });
-    } else {
-      toCreate.push(test);
-    }
+    if (existing) alreadyExists.push({ test: test.title, issue: existing });
+    else          toCreate.push(test);
   }
 
-  // Report existing issues
   let msg = `📋 *Issue Check — ${repoName}*\n\n`;
-
-  if (alreadyExists.length > 0) {
-    msg += `⚠️ *Already exists (${alreadyExists.length}):*\n`;
-    alreadyExists.forEach(e => {
-      msg += `• "${e.test}"\n  → Issue #${e.issue.number} already open\n  🔗 ${e.issue.html_url}\n`;
-    });
+  if (alreadyExists.length) {
+    msg += `⚠️ *Already open (${alreadyExists.length}):*\n`;
+    alreadyExists.forEach(e => { msg += `• "${e.test}"\n  → Issue #${e.issue.number} already exists\n  🔗 ${e.issue.html_url}\n`; });
     msg += `\n`;
   }
 
-  // Create only new issues
-  if (toCreate.length === 0) {
-    msg += `✅ All failed tests already have open issues. No new issues created.`;
+  if (!toCreate.length) {
+    msg += `✅ All failed tests already have open issues. No new ones created.`;
     await send(fromPhone, msg);
     return;
   }
 
-  msg += `🐛 Creating *${toCreate.length} new issue(s)*...\n`;
+  msg += `🐛 Creating *${toCreate.length} new issue(s)*...`;
   await send(fromPhone, msg);
 
-  const created = [];
-  const failed  = [];
-
+  const created = [], failed = [];
   for (const test of toCreate) {
     try {
       const issue = await createGitHubIssue(repo, test, runUrl);
       created.push({ title: test.title, number: issue.number, url: issue.html_url });
-      console.log(`✅ Created issue #${issue.number}: ${test.title}`);
     } catch (err) {
-      console.error(`❌ Could not create issue for ${test.title}:`, err.message);
       failed.push(test.title);
     }
   }
 
-  // Invalidate cache
   if (githubCache[repo.repo]) githubCache[repo.repo].updatedAt = 0;
 
-  let result = `✅ *Created ${created.length} issue(s):*\n`;
+  let result = `✅ *Created ${created.length}:*\n`;
   created.forEach(i => { result += `• #${i.number} — ${i.title}\n  🔗 ${i.url}\n`; });
-  if (failed.length) {
-    result += `\n⚠️ *Failed to create (${failed.length}):*\n`;
-    result += failed.map(t => `• ${t}`).join("\n");
-  }
+  if (failed.length) result += `\n⚠️ *Failed:*\n` + failed.map(t => `• ${t}`).join("\n");
   result += `\n\n💡 Say *"fix issue #<number>"* to AI-fix any issue.`;
 
   await send(fromPhone, result);
 }
 
 // ════════════════════════════════════════════════════════════════════
-//  STEP 4 — FIX ISSUE #N  →  LLM reads code → creates PR
+//  STEP 4 — FIX ISSUE #N
+//  NEW FLOW:
+//    1. Fetch issue from GitHub
+//    2. Trigger ai-fix.yml (Playwright Agent) in GitHub Actions
+//    3. Actions runs the real test → captures screenshot + DOM + error
+//    4. Actions POSTs back to /ai-fix-callback
+//    5. Callback calls Gemini with REAL data → commits fix → opens PR
 // ════════════════════════════════════════════════════════════════════
 
 async function handleFixIssue(fromPhone, issueNumber) {
   const repo = getLastRepo(fromPhone);
-  if (!repo) {
-    await send(fromPhone, `⚠️ I don't know which repo to use. Say *"run tests"* or ask about a repo first.`);
-    return;
-  }
+  if (!repo) { await send(fromPhone, `⚠️ I don't know which repo to use. Run tests first.`); return; }
+  if (!issueNumber) { await send(fromPhone, `⚠️ Include the issue number. Example: *"fix issue #12"*`); return; }
 
-  if (!issueNumber) {
-    await send(fromPhone, `⚠️ Please include the issue number. Example: *"fix issue #12"*`);
-    return;
-  }
+  await send(fromPhone, `🔍 Fetching issue #${issueNumber}...`);
 
-  await send(fromPhone, `🔍 Fetching issue #${issueNumber} from *${repo.name}*...`);
-
-  // Fetch the issue
   let issue;
   try {
     issue = await ghGet(`/repos/${repo.repo}/issues/${issueNumber}`);
   } catch (err) {
-    await send(fromPhone, `❌ Could not find issue #${issueNumber}. Check the number and try again.`);
+    await send(fromPhone, `❌ Could not find issue #${issueNumber}.`);
     return;
   }
-
-  await send(fromPhone,
-    `🤖 *AI Fix Starting — Issue #${issueNumber}*\n\n` +
-    `📋 *${issue.title}*\n\n` +
-    `Steps:\n` +
-    `  1️⃣ Reading failing test file from GitHub\n` +
-    `  2️⃣ Finding related source files\n` +
-    `  3️⃣ Reading DOM snapshots from failed run\n` +
-    `  4️⃣ Gemini analyses error + code + DOM\n` +
-    `  5️⃣ Gemini writes minimal targeted fix\n` +
-    `  6️⃣ Creates branch + commits fix\n` +
-    `  7️⃣ Opens Pull Request\n\n` +
-    `⏳ Working...`
-  );
 
   // Extract test info from issue body
   const testTitle = issue.title.replace("🐛 [Playwright] ", "").trim();
-  const testFile  = extractFileFromIssueBody(issue.body);
-  const error     = extractErrorFromIssueBody(issue.body);
-  const runUrl    = extractRunUrlFromIssueBody(issue.body) || `https://github.com/${repo.repo}/actions`;
-
-  const headers = {
-    Authorization:          `token ${GITHUB_TOKEN}`,
-    "X-GitHub-Api-Version": "2022-11-28",
-    "Content-Type":         "application/json",
-  };
-
-  // Get branch SHA
-  const branchSHA = await getDefaultBranchSHA(repo, headers);
-  if (!branchSHA) {
-    await send(fromPhone, `❌ Could not read branch info. Check GITHUB_TOKEN has \`contents:write\` permission.`);
-    return;
-  }
-
-  // Step 1: Read test file
-  console.log(`  1️⃣ Reading test file: ${testFile}`);
-  const testFileContent = testFile ? await readFile(repo, testFile, headers) : null;
-
-  // Step 2: Find related source files
-  console.log(`  2️⃣ Finding related source files...`);
-  const sourceFiles = testFileContent
-    ? await findRelatedSourceFiles(repo, { title: testTitle, file: testFile }, testFileContent, headers)
-    : [];
-
-  // Step 3: Fetch DOM snapshots from latest failed run
-  console.log(`  3️⃣ Fetching DOM/visual artifacts...`);
-  const latestRunId   = await getLatestCompletedRunId(repo);
-  const visualContext = latestRunId
-    ? await fetchVisualArtifacts(repo, latestRunId)
-    : { htmlSnapshots: [], screenshots: [] };
-
-  // Steps 4 & 5: Gemini analyses + writes fix
-  console.log(`  4️⃣ Gemini analysing...`);
-  const failedTest   = { title: testTitle, file: testFile || "unknown", error: error || "See issue body", retryCount: 0 };
-  const geminiResult = await askGeminiForFix(failedTest, testFileContent, sourceFiles, visualContext, runUrl);
-
-  if (!geminiResult?.fixes?.length) {
-    await send(fromPhone,
-      `⚠️ *Gemini could not determine a safe fix for issue #${issueNumber}.*\n\n` +
-      `Reason: ${geminiResult?.explanation || "Unknown"}\n\n` +
-      `Please review manually:\n🔗 ${issue.html_url}`
-    );
-    return;
-  }
-
-  // Step 6: Create branch + commit
-  const safeName   = testTitle.replace(/[^a-zA-Z0-9]/g, "-").slice(0, 40).toLowerCase();
-  const branchName = `ai-fix-issue-${issueNumber}-${safeName}`;
-  console.log(`  6️⃣ Creating branch: ${branchName}`);
-
-  await createBranch(repo, branchName, branchSHA, headers);
-  for (const fix of geminiResult.fixes) {
-    await commitFile(repo, branchName, fix.path, fix.content, fix.message, headers);
-    console.log(`     📝 Committed: ${fix.path}`);
-  }
-
-  // Step 7: Open PR
-  console.log(`  7️⃣ Opening PR...`);
-  const prBody = buildPRBody(failedTest, geminiResult, runUrl, visualContext);
-  const pr     = await createPR(repo, branchName, repo.branch, geminiResult.prTitle, prBody, headers);
-  console.log(`  ✅ PR #${pr.number}: ${pr.html_url}`);
-
-  // Comment on the issue linking to PR
-  await ghPost(`/repos/${repo.repo}/issues/${issueNumber}/comments`, {
-    body: `## 🤖 AI Fix Raised\n\nGemini has analysed this failure and opened a PR.\n\n**PR:** ${pr.html_url}\n**Branch:** \`${branchName}\`\n\nReview and merge, then say *"execute PR #${pr.number}"* on WhatsApp to verify.\n\n*Auto-actioned by WhatsApp QA Bot 🤖*`,
-  });
-
-  if (githubCache[repo.repo]) githubCache[repo.repo].updatedAt = 0;
+  const testFile  = extractFileFromIssueBody(issue.body) || "tests/";
 
   await send(fromPhone,
-    `✅ *AI Fix Done — Issue #${issueNumber}*\n\n` +
-    `*${geminiResult.prTitle}*\n\n` +
-    `🧠 *What Gemini fixed:*\n${geminiResult.explanation}\n\n` +
-    `📝 *Files changed:*\n${geminiResult.fixes.map(f => `• \`${f.path}\``).join("\n")}\n\n` +
-    `🔀 *PR #${pr.number}:* ${pr.html_url}\n\n` +
-    `👨‍💻 Review & merge the PR, then say:\n*"execute PR #${pr.number}"* to run the fixed tests.`
+    `🤖 *AI Fix Agent Starting — Issue #${issueNumber}*\n\n` +
+    `📋 *${issue.title}*\n\n` +
+    `🎭 *Playwright Agent will now:*\n` +
+    `  1️⃣ Run the real failing test in GitHub Actions\n` +
+    `  2️⃣ Capture screenshot of actual page state\n` +
+    `  3️⃣ Capture live DOM snapshot (real selectors)\n` +
+    `  4️⃣ Read all source + page object files\n` +
+    `  5️⃣ Send everything back here\n\n` +
+    `  Then Gemini will:\n` +
+    `  6️⃣ Analyse error + real DOM + screenshot\n` +
+    `  7️⃣ Write a precise fix (not a guess!)\n` +
+    `  8️⃣ Create branch + commit + open PR\n\n` +
+    `⏳ Triggering GitHub Actions agent now...`
   );
+
+  // Trigger the AI Fix Agent workflow
+  try {
+    await axios.post(
+      `https://api.github.com/repos/${repo.repo}/actions/workflows/${repo.aiFixWorkflow}/dispatches`,
+      {
+        ref:    repo.branch,
+        inputs: {
+          test_file:    testFile,
+          test_title:   testTitle,
+          issue_number: String(issueNumber),
+          phone_number: fromPhone,
+        },
+      },
+      { headers: { Authorization: `token ${GITHUB_TOKEN}`, "X-GitHub-Api-Version": "2022-11-28" } }
+    );
+
+    console.log(`✅ AI Fix Agent triggered for issue #${issueNumber}`);
+
+    await send(fromPhone,
+      `✅ *Playwright Agent triggered!*\n\n` +
+      `GitHub Actions is now running the real test with full browser...\n\n` +
+      `⏳ This takes ~3-5 minutes.\n` +
+      `I'll message you automatically when Gemini's fix is ready!\n\n` +
+      `🔗 Watch live: https://github.com/${repo.repo}/actions`
+    );
+
+  } catch (err) {
+    console.error("❌ Could not trigger AI Fix workflow:", err.message);
+    await send(fromPhone,
+      `⚠️ *Could not trigger AI Fix Agent.*\n\n` +
+      `Make sure \`ai-fix.yml\` is in your repo at \`.github/workflows/ai-fix.yml\`\n\n` +
+      `Error: ${err.message}`
+    );
+  }
 }
 
 // ════════════════════════════════════════════════════════════════════
-//  STEP 5 — EXECUTE PR #N  →  checkout PR branch → run Playwright → result
+//  STEP 5 — EXECUTE PR #N → run Playwright on PR branch → result
 // ════════════════════════════════════════════════════════════════════
 
 async function handleExecutePR(fromPhone, prNumber) {
   const repo = getLastRepo(fromPhone);
-  if (!repo) {
-    await send(fromPhone, `⚠️ I don't know which repo to use. Run tests first.`);
-    return;
-  }
-  if (!prNumber) {
-    await send(fromPhone, `⚠️ Please include the PR number. Example: *"execute PR #3"*`);
-    return;
-  }
+  if (!repo)    { await send(fromPhone, `⚠️ Run tests first so I know which repo.`); return; }
+  if (!prNumber){ await send(fromPhone, `⚠️ Include PR number. Example: *"execute PR #3"*`); return; }
 
-  await send(fromPhone, `🔍 Fetching PR #${prNumber} from *${repo.name}*...`);
+  await send(fromPhone, `🔍 Fetching PR #${prNumber}...`);
 
-  // Fetch PR details
   let pr;
   try {
     pr = await ghGet(`/repos/${repo.repo}/pulls/${prNumber}`);
@@ -505,7 +627,6 @@ async function handleExecutePR(fromPhone, prNumber) {
   }
 
   const prBranch = pr.head.ref;
-  const testFile = extractTestFileFromPRTitle(pr.title, pr.body);
 
   await send(fromPhone,
     `🧪 *Executing PR #${prNumber} — ${repo.name}*\n\n` +
@@ -514,39 +635,26 @@ async function handleExecutePR(fromPhone, prNumber) {
     `Triggering Playwright on the PR branch...\n⏳ Polling for results...`
   );
 
-  // Trigger the workflow on the PR branch
+  // Trigger workflow on the PR branch
   try {
     await axios.post(
       `https://api.github.com/repos/${repo.repo}/actions/workflows/${repo.workflow}/dispatches`,
-      {
-        ref:    prBranch,
-        inputs: testFile ? { grep: testFile } : {},
-      },
+      { ref: prBranch },
       { headers: { Authorization: `token ${GITHUB_TOKEN}`, "X-GitHub-Api-Version": "2022-11-28" } }
     );
   } catch (err) {
-    // Try triggering on default branch if PR branch dispatch fails
-    console.log(`⚠️ Could not dispatch on PR branch, using default: ${err.message}`);
-    try {
-      await triggerWorkflow(repo);
-    } catch (e) {
-      await send(fromPhone, `❌ Could not trigger workflow: ${e.message}\n\nMake sure your workflow supports \`workflow_dispatch\`.`);
-      return;
-    }
+    // Fallback to default branch if PR branch dispatch fails
+    console.log(`⚠️ PR branch dispatch failed (${err.message}), using default branch`);
+    try { await triggerWorkflow(repo); }
+    catch (e) { await send(fromPhone, `❌ Could not trigger workflow: ${e.message}`); return; }
   }
 
-  // Wait then track the run
   await sleep(12000);
-
   const runsRes      = await ghGet(`/repos/${repo.repo}/actions/runs?per_page=1`);
   const trackedRunId = runsRes.workflow_runs[0]?.id;
 
-  if (!trackedRunId) {
-    await send(fromPhone, `❌ Could not find the triggered run.`);
-    return;
-  }
+  if (!trackedRunId) { await send(fromPhone, `❌ Could not find the triggered run.`); return; }
 
-  // Poll until complete
   let attempt = 0;
   while (true) {
     await sleep(30000);
@@ -556,16 +664,12 @@ async function handleExecutePR(fromPhone, prNumber) {
       console.log(`⏳ PR run [${elapsed}m]: ${run.status}/${run.conclusion || "running"}`);
 
       if (run.status === "completed") {
-        // Fetch and parse the report
         await ensureReportLoaded(fromPhone, repo);
         const report = lastReports[fromPhone];
         const s      = report?.summary;
+        const icon   = run.conclusion === "success" ? "🟢" : "🔴";
 
-        const icon      = run.conclusion === "success" ? "🟢" : "🔴";
-        const allPassed = s?.failed === 0;
-
-        let resultMsg = `${icon} *PR #${prNumber} Execution Result*\n\n`;
-        resultMsg += `*${pr.title}*\n\n`;
+        let resultMsg = `${icon} *PR #${prNumber} Result*\n\n*${pr.title}*\n\n`;
 
         if (s) {
           resultMsg += `✅ Passed : ${s.passed}\n`;
@@ -573,40 +677,28 @@ async function handleExecutePR(fromPhone, prNumber) {
           resultMsg += `⊝ Skipped: ${s.skipped}\n`;
           resultMsg += `⏱ Duration: ${s.duration}s\n`;
 
-          if (allPassed) {
-            resultMsg += `\n🎉 *All tests passed!* The fix works.\n`;
-            resultMsg += `✅ Safe to merge PR #${prNumber}.\n`;
-
-            // Auto-comment on the PR
+          if (s.failed === 0) {
+            resultMsg += `\n🎉 *All tests passed! Fix works.* ✅\nSafe to merge PR #${prNumber}.`;
             await ghPost(`/repos/${repo.repo}/issues/${prNumber}/comments`, {
-              body: `## ✅ Tests Passed\n\nAll Playwright tests passed after this fix was applied.\n\n- Passed: ${s.passed}\n- Failed: ${s.failed}\n- Duration: ${s.duration}s\n\n*Verified by WhatsApp QA Bot 🤖*`,
+              body: `## ✅ Tests Passed\n\nAll Playwright tests passed on this PR's branch.\n\n- Passed: ${s.passed} / Failed: ${s.failed}\n- Duration: ${s.duration}s\n\n*Verified by WhatsApp QA Bot 🤖*`,
             });
           } else {
-            resultMsg += `\n❌ *Some tests still failing:*\n`;
-            s.failedTests?.forEach(t => {
-              resultMsg += `  • ${t.title}\n`;
-              if (t.error) resultMsg += `    ↳ ${t.error.slice(0, 120)}\n`;
-            });
-            resultMsg += `\n💡 The fix may need revision. Say *"fix issue #..."* to try again.`;
-
-            // Auto-comment on the PR
+            resultMsg += `\n❌ *Still failing:*\n`;
+            s.failedTests?.forEach(t => { resultMsg += `  • ${t.title}\n`; if (t.error) resultMsg += `    ↳ ${t.error.slice(0, 120)}\n`; });
+            resultMsg += `\n💡 Say *"fix issue #..."* to try again.`;
             await ghPost(`/repos/${repo.repo}/issues/${prNumber}/comments`, {
-              body: `## ❌ Tests Still Failing\n\nAfter applying this fix, ${s.failed} test(s) still fail:\n\n${s.failedTests?.map(t => `- \`${t.title}\`: ${t.error || "unknown error"}`).join("\n")}\n\n*Verified by WhatsApp QA Bot 🤖*`,
+              body: `## ❌ Tests Still Failing\n\n${s.failed} test(s) still fail:\n\n${s.failedTests?.map(t => `- \`${t.title}\``).join("\n")}\n\n*Verified by WhatsApp QA Bot 🤖*`,
             });
           }
         } else {
-          resultMsg += run.conclusion === "success"
-            ? `🎉 Workflow passed! (No JSON report found, check GitHub for details.)\n`
-            : `❌ Workflow failed. Check GitHub Actions for details.\n`;
+          resultMsg += run.conclusion === "success" ? `🎉 Workflow passed!` : `❌ Workflow failed.`;
         }
 
-        resultMsg += `\n🔗 ${run.html_url}`;
+        resultMsg += `\n\n🔗 ${run.html_url}`;
         await send(fromPhone, resultMsg);
         return;
       }
-    } catch (e) {
-      console.error(`⚠️ Poll error (attempt ${attempt}):`, e.message);
-    }
+    } catch (e) { console.error(`⚠️ Poll error:`, e.message); }
     attempt++;
   }
 }
@@ -616,13 +708,8 @@ async function handleExecutePR(fromPhone, prNumber) {
 // ════════════════════════════════════════════════════════════════════
 
 async function answerGeneralQuery(fromPhone, repo, question) {
-  // Refresh GitHub data if stale
   await maybeRefreshCache(repo);
-
-  // Also load test report if question is test-related
-  if (isTestRelated(question)) {
-    await ensureReportLoaded(fromPhone, repo);
-  }
+  if (isTestRelated(question)) await ensureReportLoaded(fromPhone, repo);
 
   const cache       = githubCache[repo.repo] || {};
   const report      = lastReports[fromPhone];
@@ -630,22 +717,13 @@ async function answerGeneralQuery(fromPhone, repo, question) {
   const historyText = history.map(h => `${h.role === "user" ? "User" : "Bot"}: ${h.text}`).join("\n");
   const ctx         = buildContextBlock(repo, cache, report);
 
-  const prompt = `You are an expert QA engineer and GitHub assistant on WhatsApp.
-You have FULL access to live GitHub repo data for ${repo.name} (${repo.repo}).
-
-═══════════════════════════════════
-LIVE GITHUB DATA
-═══════════════════════════════════
-${ctx}
-═══════════════════════════════════
-
-RECENT CONVERSATION:
-${historyText || "(none)"}
-
-USER QUESTION: "${question}"
-
-Answer accurately and in detail using the data above.
-Use emojis and *bold* WhatsApp formatting. Be thorough — the user is asking for detail.`;
+  const prompt =
+    `You are an expert QA engineer and GitHub assistant on WhatsApp.\n` +
+    `You have full access to live GitHub data for ${repo.name} (${repo.repo}).\n\n` +
+    `LIVE GITHUB DATA:\n${ctx}\n\n` +
+    `RECENT CONVERSATION:\n${historyText || "(none)"}\n\n` +
+    `USER QUESTION: "${question}"\n\n` +
+    `Answer accurately and in detail. Use emojis and *bold* WhatsApp formatting.`;
 
   try {
     const response = await axios.post(GEMINI_URL, { contents: [{ parts: [{ text: prompt }] }] });
@@ -654,91 +732,8 @@ Use emojis and *bold* WhatsApp formatting. Be thorough — the user is asking fo
     addHistory(fromPhone, "assistant", answer);
     await send(fromPhone, answer);
   } catch (err) {
-    console.error("❌ Gemini error:", err.message);
     await send(fromPhone, "⚠️ Had trouble answering. Please try again.");
   }
-}
-
-// ════════════════════════════════════════════════════════════════════
-//  GEMINI — AI FIX
-// ════════════════════════════════════════════════════════════════════
-
-async function askGeminiForFix(failedTest, testFileContent, sourceFiles, visualContext, runUrl) {
-  const sourceCtx = sourceFiles.map(f =>
-    `FILE: ${f.path}\n\`\`\`\n${f.content.slice(0, 2500)}\n\`\`\``
-  ).join("\n\n");
-
-  const domCtx = (visualContext.htmlSnapshots || []).map(h =>
-    `DOM SNAPSHOT (${h.name}):\n\`\`\`html\n${h.content}\n\`\`\``
-  ).join("\n\n");
-
-  const prompt = `You are an expert QA automation engineer. Fix this failing Playwright test.
-
-FAILING TEST: "${failedTest.title}"
-FILE: ${failedTest.file}
-ERROR:
-${failedTest.error || "No error captured"}
-RUN URL: ${runUrl}
-
-TEST FILE:
-${(testFileContent || "Could not read").slice(0, 4000)}
-
-RELATED SOURCE FILES:
-${sourceCtx || "None found."}
-
-DOM SNAPSHOTS FROM FAILED RUN:
-${domCtx || "None available."}
-
-INSTRUCTIONS:
-1. Carefully read the error and find the ROOT CAUSE
-2. Check if selectors match the DOM above
-3. Look for timing/async issues
-4. Write COMPLETE fixed file content (not diffs)
-5. Make MINIMAL targeted changes only
-
-Reply ONLY with valid JSON (no markdown fences):
-{
-  "prTitle": "fix: <short description>",
-  "explanation": "<2-3 sentences: root cause and what you changed>",
-  "fixes": [
-    {
-      "path": "relative/path/to/file.ts",
-      "message": "fix: <what changed>",
-      "content": "<COMPLETE file content>"
-    }
-  ]
-}
-
-If you cannot determine a safe fix, return: { "fixes": [], "explanation": "<reason>", "prTitle": "" }`;
-
-  try {
-    const response = await axios.post(GEMINI_URL, { contents: [{ parts: [{ text: prompt }] }] });
-    let raw = response.data.candidates[0].content.parts[0].text.trim();
-    raw = raw.replace(/^```json\s*/i, "").replace(/^```\s*/i, "").replace(/```$/i, "").trim();
-    return JSON.parse(raw);
-  } catch (err) {
-    console.error("❌ Gemini fix error:", err.message);
-    return null;
-  }
-}
-
-async function findRelatedSourceFiles(repo, failedTest, testContent, headers) {
-  const files = [];
-  try {
-    const prompt = `List source/page-object files this Playwright test imports or depends on. Max 3. Relative paths. Reply JSON array only.
-Test file: ${failedTest.file}
-Content: ${testContent.slice(0, 1500)}`;
-    const response = await axios.post(GEMINI_URL, { contents: [{ parts: [{ text: prompt }] }] });
-    let raw = response.data.candidates[0].content.parts[0].text.trim().replace(/^```json\s*/i, "").replace(/^```\s*/i, "").replace(/```$/i, "").trim();
-    const paths = JSON.parse(raw);
-    if (Array.isArray(paths)) {
-      for (const p of paths.slice(0, 3)) {
-        const content = await readFile(repo, p, headers);
-        if (content) files.push({ path: p, content });
-      }
-    }
-  } catch (_) {}
-  return files;
 }
 
 // ════════════════════════════════════════════════════════════════════
@@ -765,39 +760,24 @@ async function triggerWorkflow(repo) {
     { ref: repo.branch },
     { headers: { Authorization: `token ${GITHUB_TOKEN}`, "X-GitHub-Api-Version": "2022-11-28" } }
   );
-  console.log("✅ Workflow triggered");
 }
 
 async function getDefaultBranchSHA(repo, headers) {
   try {
     const res = await axios.get(`https://api.github.com/repos/${repo.repo}/git/ref/heads/${repo.branch}`, { headers });
     return res.data.object.sha;
-  } catch (err) {
-    console.error("❌ getDefaultBranchSHA:", err.message);
-    return null;
-  }
-}
-
-async function readFile(repo, filePath, headers) {
-  try {
-    const res = await axios.get(`https://api.github.com/repos/${repo.repo}/contents/${filePath}`, { headers });
-    return Buffer.from(res.data.content, "base64").toString("utf8");
-  } catch (_) { return null; }
+  } catch (err) { return null; }
 }
 
 async function createBranch(repo, branchName, sha, headers) {
-  await axios.post(
-    `https://api.github.com/repos/${repo.repo}/git/refs`,
-    { ref: `refs/heads/${branchName}`, sha },
-    { headers }
-  );
+  await axios.post(`https://api.github.com/repos/${repo.repo}/git/refs`, { ref: `refs/heads/${branchName}`, sha }, { headers });
 }
 
 async function commitFile(repo, branchName, filePath, content, message, headers) {
   let existingSha;
   try {
-    const existing = await axios.get(`https://api.github.com/repos/${repo.repo}/contents/${filePath}?ref=${branchName}`, { headers });
-    existingSha = existing.data.sha;
+    const ex = await axios.get(`https://api.github.com/repos/${repo.repo}/contents/${filePath}?ref=${branchName}`, { headers });
+    existingSha = ex.data.sha;
   } catch (_) {}
   const payload = { message, content: Buffer.from(content).toString("base64"), branch: branchName };
   if (existingSha) payload.sha = existingSha;
@@ -805,45 +785,8 @@ async function commitFile(repo, branchName, filePath, content, message, headers)
 }
 
 async function createPR(repo, head, base, title, body, headers) {
-  const res = await axios.post(
-    `https://api.github.com/repos/${repo.repo}/pulls`,
-    { title, body, head, base, draft: false },
-    { headers }
-  );
+  const res = await axios.post(`https://api.github.com/repos/${repo.repo}/pulls`, { title, body, head, base, draft: false }, { headers });
   return res.data;
-}
-
-async function getLatestCompletedRunId(repo) {
-  try {
-    const res = await ghGet(`/repos/${repo.repo}/actions/runs?per_page=5&status=completed`);
-    return res.workflow_runs[0]?.id || null;
-  } catch (_) { return null; }
-}
-
-async function fetchVisualArtifacts(repo, runId) {
-  const ctx = { htmlSnapshots: [], screenshots: [] };
-  try {
-    const artifactsRes = await ghGet(`/repos/${repo.repo}/actions/runs/${runId}/artifacts`);
-    const target = (artifactsRes.artifacts || []).find(a =>
-      ["playwright-report", "test-results", "screenshots"].some(n => a.name.toLowerCase().includes(n))
-    );
-    if (!target) return ctx;
-
-    const downloadRes = await axios.get(
-      `https://api.github.com/repos/${repo.repo}/actions/artifacts/${target.id}/zip`,
-      { headers: { Authorization: `token ${GITHUB_TOKEN}` }, responseType: "arraybuffer", maxRedirects: 5 }
-    );
-    const { default: JSZip } = await import("jszip");
-    const zip   = await JSZip.loadAsync(downloadRes.data);
-    const files = Object.keys(zip.files);
-
-    for (const f of files.filter(f => f.endsWith(".html")).slice(0, 3)) {
-      const content = await zip.files[f].async("string");
-      ctx.htmlSnapshots.push({ name: f, content: content.slice(0, 3000) });
-    }
-    ctx.screenshots = files.filter(f => f.match(/\.(png|jpg)$/i)).slice(0, 5);
-  } catch (_) {}
-  return ctx;
 }
 
 async function createGitHubIssue(repo, failedTest, runUrl) {
@@ -854,7 +797,6 @@ async function createGitHubIssue(repo, failedTest, runUrl) {
     `## Error\n\`\`\`\n${failedTest.error || "No error captured"}\n\`\`\`\n\n` +
     `## Run\n${runUrl}\n\n` +
     `---\n*Auto-created by WhatsApp QA Bot 🤖*`;
-
   const res = await axios.post(
     `https://api.github.com/repos/${repo.repo}/issues`,
     { title: `🐛 [Playwright] ${failedTest.title}`, body, labels: ["bug", "playwright", "automated"] },
@@ -863,25 +805,39 @@ async function createGitHubIssue(repo, failedTest, runUrl) {
   return res.data;
 }
 
+function buildPRBody(issueNumber, testTitle, testFile, error, geminiResult, runUrl, artifacts) {
+  const files   = geminiResult.fixes.map(f => `- \`${f.path}\``).join("\n");
+  const hasReal = artifacts?.screenshotBase64 || artifacts?.domSnapshot;
+  return (
+    `## 🤖 AI Auto-Fix (Playwright Agent)\n\n` +
+    `Closes #${issueNumber}\n\n` +
+    `### ❌ Failing Test\n**\`${testTitle}\`**\nFile: \`${testFile}\`\n\n` +
+    `### 💥 Error\n\`\`\`\n${error || "See issue"}\n\`\`\`\n\n` +
+    `### 🎭 How the fix was generated\n` +
+    (hasReal
+      ? `A Playwright agent ran the **real test** in GitHub Actions and captured:\n- 📸 Screenshot of actual page at failure\n- 🖥️ Live DOM snapshot (real selectors)\n- 📁 All source + page object files\n\nGemini analysed this **real browser data** to write the fix.\n\n`
+      : `Gemini analysed the error + source code to write the fix.\n\n`) +
+    `### 🧠 Root Cause\n${geminiResult.rootCause}\n\n` +
+    `### 🔧 What Was Fixed\n${geminiResult.explanation}\n\n` +
+    `### 📝 Files Changed\n${files}\n\n` +
+    `### 🔗 Failing Run\n${runUrl}\n\n` +
+    `---\n> ⚠️ Review carefully before merging.\n> After merging say *"execute PR #${"{PR_NUMBER}"}"* on WhatsApp to verify.\n\n` +
+    `*Auto-generated by WhatsApp QA Bot + Playwright Agent 🤖*`
+  );
+}
+
 // ════════════════════════════════════════════════════════════════════
-//  PLAYWRIGHT REPORT
+//  PLAYWRIGHT REPORT LOADING
 // ════════════════════════════════════════════════════════════════════
 
 async function ensureReportLoaded(fromPhone, repo) {
   try {
-    const headers   = { Authorization: `token ${GITHUB_TOKEN}`, "X-GitHub-Api-Version": "2022-11-28" };
-    const runsRes   = await ghGet(`/repos/${repo.repo}/actions/runs?per_page=5&status=completed`);
-    const run       = runsRes.workflow_runs[0];
+    const runsRes  = await ghGet(`/repos/${repo.repo}/actions/runs?per_page=5&status=completed`);
+    const run      = runsRes.workflow_runs[0];
     if (!run) return;
-
-    const artRes      = await ghGet(`/repos/${repo.repo}/actions/runs/${run.id}/artifacts`);
-    const jsonArt     = artRes.artifacts.find(a => a.name === "json-report");
-
-    if (!jsonArt) {
-      lastReports[fromPhone] = { repo, repoName: repo.name, runUrl: run.html_url, conclusion: run.conclusion, summary: null, fetchedAt: Date.now() };
-      return;
-    }
-
+    const artRes   = await ghGet(`/repos/${repo.repo}/actions/runs/${run.id}/artifacts`);
+    const jsonArt  = artRes.artifacts.find(a => a.name === "json-report");
+    if (!jsonArt) { lastReports[fromPhone] = { repo, repoName: repo.name, runUrl: run.html_url, conclusion: run.conclusion, summary: null, fetchedAt: Date.now() }; return; }
     const dlRes = await axios.get(
       `https://api.github.com/repos/${repo.repo}/actions/artifacts/${jsonArt.id}/zip`,
       { headers: { Authorization: `token ${GITHUB_TOKEN}` }, responseType: "arraybuffer", maxRedirects: 5 }
@@ -890,13 +846,10 @@ async function ensureReportLoaded(fromPhone, repo) {
     const zip  = await JSZip.loadAsync(dlRes.data);
     const file = zip.file("playwright-results.json");
     if (!file) return;
-
     const summary = extractSummary(JSON.parse(await file.async("string")));
     lastReports[fromPhone] = { repo, repoName: repo.name, runUrl: run.html_url, conclusion: run.conclusion, summary, fetchedAt: Date.now() };
     console.log(`✅ Report: ${summary.passed}p ${summary.failed}f ${summary.skipped}s`);
-  } catch (err) {
-    console.error("❌ ensureReportLoaded:", err.message);
-  }
+  } catch (err) { console.error("❌ ensureReportLoaded:", err.message); }
 }
 
 function extractSummary(report) {
@@ -908,8 +861,8 @@ function extractSummary(report) {
         const status = test.status || test.results?.[0]?.status;
         const error  = test.results?.[0]?.error?.message || null;
         s.duration  += test.results?.[0]?.duration || 0;
-        if (status === "passed"  || status === "expected")        { s.passed++;  s.passedTests.push({ title: spec.title, file }); }
-        else if (status === "failed" || status === "unexpected")  { s.failed++;  s.failedTests.push({ title: spec.title, file, error }); }
+        if      (status === "passed"  || status === "expected")   { s.passed++;  s.passedTests.push({ title: spec.title, file }); }
+        else if (status === "failed"  || status === "unexpected") { s.failed++;  s.failedTests.push({ title: spec.title, file, error }); }
         else if (status === "skipped" || status === "pending")    { s.skipped++; s.skippedTests.push({ title: spec.title, file }); }
       }
     }
@@ -922,106 +875,80 @@ function extractSummary(report) {
 }
 
 // ════════════════════════════════════════════════════════════════════
-//  GITHUB CONTEXT CACHE
+//  GITHUB CACHE
 // ════════════════════════════════════════════════════════════════════
 
 async function maybeRefreshCache(repo) {
   const c = githubCache[repo.repo];
-  if (!c || Date.now() - c.updatedAt > CACHE_TTL) {
-    const headers = { Authorization: `token ${GITHUB_TOKEN}`, "X-GitHub-Api-Version": "2022-11-28" };
-    const base    = `https://api.github.com/repos/${repo.repo}`;
-    const [ir, pr, cr, br, wr, rr] = await Promise.allSettled([
-      axios.get(`${base}/issues?state=open&per_page=50`,  { headers }),
-      axios.get(`${base}/pulls?state=open&per_page=20`,   { headers }),
-      axios.get(`${base}/commits?per_page=20`,            { headers }),
-      axios.get(`${base}/branches?per_page=30`,           { headers }),
-      axios.get(`${base}/actions/runs?per_page=10`,       { headers }),
-      axios.get(`${base}`,                                { headers }),
-    ]);
-    githubCache[repo.repo] = {
-      issues:    ir.status === "fulfilled" ? ir.value.data : [],
-      prs:       pr.status === "fulfilled" ? pr.value.data : [],
-      commits:   cr.status === "fulfilled" ? cr.value.data : [],
-      branches:  br.status === "fulfilled" ? br.value.data : [],
-      workflows: wr.status === "fulfilled" ? wr.value.data.workflow_runs : [],
-      repoInfo:  rr.status === "fulfilled" ? rr.value.data : null,
-      updatedAt: Date.now(),
-    };
-  }
+  if (c && Date.now() - c.updatedAt < CACHE_TTL) return;
+  const headers = { Authorization: `token ${GITHUB_TOKEN}`, "X-GitHub-Api-Version": "2022-11-28" };
+  const base    = `https://api.github.com/repos/${repo.repo}`;
+  const [ir, pr, cr, br, wr, rr] = await Promise.allSettled([
+    axios.get(`${base}/issues?state=open&per_page=50`,  { headers }),
+    axios.get(`${base}/pulls?state=open&per_page=20`,   { headers }),
+    axios.get(`${base}/commits?per_page=20`,            { headers }),
+    axios.get(`${base}/branches?per_page=30`,           { headers }),
+    axios.get(`${base}/actions/runs?per_page=10`,       { headers }),
+    axios.get(`${base}`,                                { headers }),
+  ]);
+  githubCache[repo.repo] = {
+    issues:    ir.status === "fulfilled" ? ir.value.data : [],
+    prs:       pr.status === "fulfilled" ? pr.value.data : [],
+    commits:   cr.status === "fulfilled" ? cr.value.data : [],
+    branches:  br.status === "fulfilled" ? br.value.data : [],
+    workflows: wr.status === "fulfilled" ? wr.value.data.workflow_runs : [],
+    repoInfo:  rr.status === "fulfilled" ? rr.value.data : null,
+    updatedAt: Date.now(),
+  };
 }
 
 function buildContextBlock(repo, cache, report) {
   const lines = [];
-  if (cache.repoInfo) {
-    const r = cache.repoInfo;
-    lines.push(`REPO: ${r.full_name} | Stars:${r.stargazers_count} | Lang:${r.language} | Branch:${r.default_branch} | Open issues:${r.open_issues_count}`);
-  }
+  if (cache.repoInfo) { const r = cache.repoInfo; lines.push(`REPO: ${r.full_name} | Stars:${r.stargazers_count} | Lang:${r.language} | Branch:${r.default_branch} | Open issues:${r.open_issues_count}`); }
   lines.push(`\nOPEN ISSUES (${cache.issues?.length || 0}):`);
   (cache.issues || []).forEach(i => lines.push(`  #${i.number} [${i.labels?.map(l=>l.name).join(",")||"none"}] "${i.title}" — @${i.user?.login} | ${i.created_at?.slice(0,10)}`));
-  if (cache.prs?.length) {
-    lines.push(`\nOPEN PRs (${cache.prs.length}):`);
-    cache.prs.forEach(p => lines.push(`  #${p.number} "${p.title}" — @${p.user?.login} | ${p.head?.ref}→${p.base?.ref}`));
-  }
-  if (cache.commits?.length) {
-    lines.push(`\nRECENT COMMITS:`);
-    cache.commits.slice(0, 10).forEach(c => lines.push(`  [${c.commit?.author?.date?.slice(0,10)}] ${c.sha?.slice(0,7)} ${c.commit?.author?.name}: ${c.commit?.message?.split("\n")[0]}`));
-  }
+  if (cache.prs?.length) { lines.push(`\nOPEN PRs:`); cache.prs.forEach(p => lines.push(`  #${p.number} "${p.title}" — @${p.user?.login} | ${p.head?.ref}→${p.base?.ref}`)); }
+  if (cache.commits?.length) { lines.push(`\nRECENT COMMITS:`); cache.commits.slice(0,10).forEach(c => lines.push(`  [${c.commit?.author?.date?.slice(0,10)}] ${c.sha?.slice(0,7)} ${c.commit?.author?.name}: ${c.commit?.message?.split("\n")[0]}`)); }
   if (cache.branches?.length) lines.push(`\nBRANCHES: ${cache.branches.map(b=>b.name).join(" | ")}`);
-  if (cache.workflows?.length) {
-    lines.push(`\nWORKFLOW RUNS:`);
-    cache.workflows.slice(0, 5).forEach(w => lines.push(`  [${w.created_at?.slice(0,10)}] "${w.name}" ${w.status}/${w.conclusion||"running"} — ${w.html_url}`));
-  }
+  if (cache.workflows?.length) { lines.push(`\nWORKFLOW RUNS:`); cache.workflows.slice(0,5).forEach(w => lines.push(`  [${w.created_at?.slice(0,10)}] "${w.name}" ${w.status}/${w.conclusion||"running"}`)); }
   if (report?.summary) {
     const s = report.summary;
-    lines.push(`\nPLAYWRIGHT REPORT: ${report.repoName} | ${report.conclusion}`);
-    lines.push(`  ✅${s.passed} ❌${s.failed} ⊝${s.skipped} 📈${s.total} ⏱${s.duration}s`);
-    lines.push(`  Run: ${report.runUrl}`);
+    lines.push(`\nPLAYWRIGHT: ${report.repoName} | ${report.conclusion} | ✅${s.passed} ❌${s.failed} ⊝${s.skipped} ⏱${s.duration}s`);
     s.failedTests?.forEach(t => lines.push(`  FAIL: "${t.title}" (${t.file}) — ${t.error||"unknown"}`));
-    if (s.passedTests?.length) lines.push(`  PASSED: ${s.passedTests.slice(0,15).map(t=>t.title).join(" | ")}`);
+    if (s.passedTests?.length) lines.push(`  PASSED: ${s.passedTests.slice(0,10).map(t=>t.title).join(" | ")}`);
   }
   return lines.join("\n");
 }
 
 // ════════════════════════════════════════════════════════════════════
-//  INTENT DETECTION
+//  INTENT + UTILITIES
 // ════════════════════════════════════════════════════════════════════
 
 async function detectIntent(message) {
   try {
-    const prompt = `Classify this WhatsApp message for a GitHub QA bot. Reply with ONLY the intent word.
-
-Intents:
-- "run_tests"      → run/trigger/execute/start tests
-- "create_issues"  → create issues / log issues / raise issues for failed tests
-- "fix_issue"      → fix issue #N / ai fix issue / resolve issue #N
-- "execute_pr"     → execute PR #N / run PR #N / test PR #N / verify PR #N
-- "general"        → anything else (questions about repo, results, commits, PRs, branches, etc.)
-
-Message: "${message}"`;
-
+    const prompt =
+      `Classify this WhatsApp message for a GitHub QA bot. Reply with ONLY the intent word.\n\n` +
+      `Intents:\n` +
+      `- "run_tests"      → run/trigger/execute/start tests\n` +
+      `- "create_issues"  → create/log/raise issues for failed tests\n` +
+      `- "fix_issue"      → fix issue #N / ai fix / resolve issue\n` +
+      `- "execute_pr"     → execute/run/test/verify PR #N\n` +
+      `- "general"        → everything else\n\n` +
+      `Message: "${message}"`;
     const res    = await axios.post(GEMINI_URL, { contents: [{ parts: [{ text: prompt }] }] });
     const intent = res.data.candidates[0].content.parts[0].text.trim().toLowerCase();
-    return ["run_tests", "create_issues", "fix_issue", "execute_pr"].includes(intent) ? intent : "general";
+    return ["run_tests","create_issues","fix_issue","execute_pr"].includes(intent) ? intent : "general";
   } catch (_) {
     const l = message.toLowerCase();
     if (l.includes("run test") || l.includes("trigger") || l.includes("execute test")) return "run_tests";
     if (l.includes("create issue") || l.includes("log issue") || l.includes("raise issue")) return "create_issues";
     if (l.match(/fix issue\s*#?\d+/i) || l.includes("ai fix")) return "fix_issue";
-    if (l.match(/execute pr\s*#?\d+/i) || l.match(/run pr\s*#?\d+/i) || l.match(/test pr\s*#?\d+/i)) return "execute_pr";
+    if (l.match(/execute pr\s*#?\d+/i) || l.match(/run pr\s*#?\d+/i)) return "execute_pr";
     return "general";
   }
 }
 
-// ════════════════════════════════════════════════════════════════════
-//  UTILITIES
-// ════════════════════════════════════════════════════════════════════
-
-function extractIssueNumber(message) {
-  const match = message.match(/#?(\d+)/);
-  return match ? parseInt(match[1]) : null;
-}
-
-function extractPRNumber(message) {
+function extractNumber(message) {
   const match = message.match(/#?(\d+)/);
   return match ? parseInt(match[1]) : null;
 }
@@ -1031,74 +958,15 @@ function extractFileFromIssueBody(body = "") {
   return match ? match[1] : null;
 }
 
-function extractErrorFromIssueBody(body = "") {
-  const match = body.match(/## Error\s*```[\s\S]*?\n([\s\S]*?)```/);
-  return match ? match[1].trim() : null;
-}
-
-function extractRunUrlFromIssueBody(body = "") {
-  const match = body.match(/https:\/\/github\.com\/[^\s)]+\/actions\/runs\/\d+/);
-  return match ? match[0] : null;
-}
-
-function extractTestFileFromPRTitle(title = "", body = "") {
-  // Try to get grep/test name from PR body
-  const match = body?.match(/Test:\*\*\s*`([^`]+)`/);
-  return match ? match[1] : null;
-}
-
-function extractFileFromIssueBody2(body = "") {
-  const match = body?.match(/npx playwright test --grep "([^"]+)"/);
-  return match ? match[1] : null;
-}
-
-function buildPRBody(failedTest, geminiResult, runUrl, visualContext = {}) {
-  const files  = geminiResult.fixes.map(f => `- \`${f.path}\``).join("\n");
-  const domNote = visualContext?.htmlSnapshots?.length
-    ? `\n### 🖥️ DOM Context\nGemini analysed ${visualContext.htmlSnapshots.length} DOM snapshot(s) from the failed run.`
-    : "";
-  return `## 🤖 AI Auto-Fix — Playwright Test Failure
-
-### ❌ Failing Test
-**Test:** \`${failedTest.title}\`
-**File:** \`${failedTest.file}\`
-
-### 💥 Error
-\`\`\`
-${failedTest.error || "See issue"}
-\`\`\`
-
-### 🧠 Root Cause & Fix
-${geminiResult.explanation}
-${domNote}
-
-### 📝 Files Changed
-${files}
-
-### 🔗 Failing Run
-${runUrl}
-
----
-> ⚠️ Review carefully before merging.
-> After merging say *"execute PR #${"{PR_NUMBER}"}"* on WhatsApp to verify.
-
-*Auto-generated by WhatsApp QA Bot 🤖*`;
-}
-
 function detectRepo(message) {
   const lower = message.toLowerCase();
-  return REPOS.find(r =>
-    r.keywords.some(k => lower.includes(k)) ||
-    r.name.toLowerCase().split(" ").some(w => w.length > 2 && lower.includes(w))
-  ) || null;
+  return REPOS.find(r => r.keywords.some(k => lower.includes(k)) || r.name.toLowerCase().split(" ").some(w => w.length > 2 && lower.includes(w))) || null;
 }
 
-function getLastRepo(fromPhone) {
-  return lastReports[fromPhone]?.repo || null;
-}
+function getLastRepo(fromPhone) { return lastReports[fromPhone]?.repo || null; }
 
 function isTestRelated(message) {
-  return ["test", "fail", "pass", "skip", "playwright", "result", "error", "workflow", "run"].some(k => message.toLowerCase().includes(k));
+  return ["test","fail","pass","skip","playwright","result","error","workflow","run"].some(k => message.toLowerCase().includes(k));
 }
 
 function resolveRepo(input) {
@@ -1122,23 +990,24 @@ function buildHelpMessage() {
   return (
     `🤖 *WhatsApp QA Bot*\n\n` +
     `*The flow:*\n` +
-    `  1️⃣ "run tests" → minimal report\n` +
-    `  2️⃣ Ask anything → detailed answer\n` +
-    `  3️⃣ "create issues for failed tests"\n` +
-    `     → checks existing, creates only new\n` +
-    `  4️⃣ "fix issue #12"\n` +
-    `     → AI reads code + DOM → opens PR\n` +
-    `  5️⃣ "execute PR #3"\n` +
+    `  1️⃣ *"run tests"*\n` +
+    `     → triggers workflow → minimal report\n\n` +
+    `  2️⃣ *Ask anything*\n` +
+    `     → detailed answers from live GitHub data\n\n` +
+    `  3️⃣ *"create issues for failed tests"*\n` +
+    `     → checks existing issues first\n` +
+    `     → only creates new ones\n\n` +
+    `  4️⃣ *"fix issue #12"*\n` +
+    `     → Playwright Agent runs real test\n` +
+    `     → captures screenshot + DOM + error\n` +
+    `     → Gemini writes fix from real data\n` +
+    `     → creates PR automatically\n\n` +
+    `  5️⃣ *"execute PR #3"*\n` +
     `     → runs Playwright on PR branch\n` +
-    `     → tells you pass ✅ or fail ❌\n\n` +
-    `*Ask anything about the repo:*\n` +
-    `• "show open issues"\n` +
-    `• "which tests failed and why?"\n` +
-    `• "any open PRs?"\n` +
-    `• "last 5 commits"\n` +
-    `• "list branches"\n\n` +
+    `     → pass ✅ or fail ❌\n\n` +
     `*Repos:*\n${buildRepoMenu()}\n\n` +
-    `• "clear" → reset session`
+    `• "clear" → reset session\n` +
+    `• "help" → this menu`
   );
 }
 
