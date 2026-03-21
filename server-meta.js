@@ -279,9 +279,18 @@ If you cannot determine a safe fix from the available data, return:
     }
 
     const safeName   = testTitle.replace(/[^a-zA-Z0-9]/g, "-").slice(0, 40).toLowerCase();
-    const branchName = `ai-fix-issue-${issueNumber}-${safeName}`;
+    const branchName = `ai-fix-issue-${issueNumber}-${safeName}-${Date.now()}`;
 
-    await createBranch(repo, branchName, branchSHA, headers);
+    try {
+      await createBranch(repo, branchName, branchSHA, headers);
+    } catch (err) {
+      // Branch might already exist — delete and recreate
+      if (err.response?.status === 422) {
+        console.log(`⚠️ Branch exists, using new timestamp name`);
+      } else {
+        throw err;
+      }
+    }
 
     for (const fix of geminiResult.fixes) {
       await commitFile(repo, branchName, fix.path, fix.content, fix.message, headers);
@@ -316,7 +325,7 @@ If you cannot determine a safe fix from the available data, return:
 
   } catch (err) {
     console.error("❌ writeFixAndCreatePR error:", err.message);
-    await send(phone, `❌ Something went wrong writing the fix: ${err.message}`);
+    await send(phone, `❌ Fix failed: ${err.response?.status || ""} ${err.response?.data?.message || err.message}`);
   }
 }
 
