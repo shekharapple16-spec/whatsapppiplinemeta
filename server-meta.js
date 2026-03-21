@@ -45,15 +45,15 @@ const REPOS = [
 ];
 
 // ─── In-memory store ──────────────────────────────────────────────
-const chatHistory = {};   // { phone: [{role, text}] }
-const sessions    = {};   // { phone: { state, action } }
-const lastReports = {};   // { phone: { repoName, json, runUrl, timestamp } }
+const chatHistory = {};  // { phone: [{role, text}] }
+const sessions    = {};  // { phone: { state, action, repo } }
+const lastReports = {};  // { phone: { repo, repoName, summary, runUrl, conclusion, fetchedAt } }
 const MAX_HISTORY = 10;
 
 // ─── System prompt ────────────────────────────────────────────────
 const SYSTEM_PROMPT = `You are an expert QA automation engineer assistant on WhatsApp.
 You help with Playwright, GitHub Actions, debugging, and QA best practices.
-You can trigger tests and answer ANY question about test results using stored JSON reports.
+You can trigger tests, answer questions about results, and create GitHub issues for failures.
 
 Available repos:
 ${REPOS.map(r => `${r.id}. ${r.name}`).join("\n")}
@@ -61,13 +61,12 @@ ${REPOS.map(r => `${r.id}. ${r.name}`).join("\n")}
 Personality: friendly, concise. Use emojis and *bold* WhatsApp formatting.
 Max 300 words unless asked for more.
 
-Special commands:
+Commands:
 - "run tests" → pick repo and trigger
 - "status" → get latest results
-- "which tests failed?" → answer from stored JSON report
-- "which tests skipped?" → answer from stored JSON report
-- "show me errors" → answer from stored JSON report
-- "clear" → reset chat memory
+- "which tests failed/skipped?" → from live GitHub report
+- "create issues" → create GitHub issues for all failed tests
+- "clear" → reset memory
 - "help" → show commands`;
 
 // ─── Webhook verify ───────────────────────────────────────────────
@@ -91,10 +90,8 @@ app.post("/webhook", async (req, res) => {
       const fromPhone   = body.entry[0].changes[0].value.messages[0].from;
       const messageBody = body.entry[0].changes[0].value.messages[0].text?.body;
       if (!messageBody) return res.sendStatus(200);
-
       console.log(`📱 [${fromPhone}]: ${messageBody}`);
       res.sendStatus(200);
-
       await handleMessage(fromPhone, messageBody.trim());
     } else {
       res.sendStatus(200);
@@ -139,20 +136,18 @@ async function handleMessage(fromPhone, message) {
         await triggerGitHubWorkflow(repo);
         checkWorkflowStatus(fromPhone, repo);
       } else if (session.action === "status") {
-        await sendWhatsAppMessage(fromPhone, `🔍 Fetching *${repo.name}* latest results...`);
-        await fetchAndStoreReport(fromPhone, repo);
-        const report = lastReports[fromPhone];
-        if (report) {
-          const summary = await generateAISummaryFromJSON(fromPhone, "Give me a full summary of these test results");
-          addToHistory(fromPhone, "assistant", summary);
-          await sendWhatsAppMessage(fromPhone, summary);
-        } else {
-          await sendWhatsAppMessage(fromPhone, "⚠️ No report found. Run tests first!");
-        }
+        await sendWhatsAppMessage(fromPhone, `🔍 Fetching *${repo.name}* latest report from GitHub...`);
+        await ensureReportLoaded(fromPhone, repo);
+        const answer = await generateAISummaryFromJSON(fromPhone,
+          "Give me a complete summary of the test results"
+        );
+        addToHistory(fromPhone, "assistant", answer);
+        await sendWhatsAppMessage(fromPhone, answer);
+        await sendWhatsAppMessage(fromPhone, buildPostResultTip());
       }
     } else {
       await sendWhatsAppMessage(fromPhone,
-        `❓ Couldn't find that repo. Reply with a *number* or *name*:\n\n${buildRepoMenu()}`
+        `❓ Couldn't find that repo. Reply with *number* or *name*:\n\n${buildRepoMenu()}`
       );
     }
     return;
@@ -174,15 +169,15 @@ async function handleMessage(fromPhone, message) {
       `📊 Which repo's results do you want?\n\n${buildRepoMenu()}\n\nReply with *number* or *name*`
     );
 
-  } else if (intent === "ask_report" && lastReports[fromPhone]) {
-    // ── User asking about stored report (which failed, skipped, errors etc) ──
-    addToHistory(fromPhone, "user", message);
-    const reply = await generateAISummaryFromJSON(fromPhone, message);
-    addToHistory(fromPhone, "assistant", reply);
-    await sendWhatsAppMessage(fromPhone, reply);
+  } else if (intent === "create_issues") {
+    // ✅ Create GitHub issues for failed tests
+    await handleCreateIssues(fromPhone);
+
+  } else if (intent === "ask_report") {
+    await handleReportQuestion(fromPhone, message);
 
   } else {
-    // ── General chat with memory ──
+    // General chat with memory
     addToHistory(fromPhone, "user", message);
     const reply = await chatWithGemini(fromPhone);
     addToHistory(fromPhone, "assistant", reply);
@@ -190,110 +185,219 @@ async function handleMessage(fromPhone, message) {
   }
 }
 
+// ─── Create GitHub Issues for failed tests ────────────────────────
+async function handleCreateIssues(fromPhone) {
+  const report = lastReports[fromPhone];
+
+  // Auto re-fetch if no report
+  if (!report?.summary) {
+    if (!report?.repo) {
+      sessions[fromPhone] = { state: "awaiting_repo_selection", action: "status" };
+      await sendWhatsAppMessage(fromPhone,
+        `📊 Which repo's failures should I create issues for?\n\n${buildRepoMenu()}`
+      );
+      return;
+    }
+    await sendWhatsAppMessage(fromPhone, "🔄 Fetching latest report first...");
+    await ensureReportLoaded(fromPhone, report.repo);
+  }
+
+  const { summary, repoName, runUrl, repo } = lastReports[fromPhone];
+
+  if (!summary?.failedTests?.length) {
+    await sendWhatsAppMessage(fromPhone,
+      `🎉 *No failed tests in ${repoName}!*\n\nNothing to create issues for. All good! ✅`
+    );
+    return;
+  }
+
+  await sendWhatsAppMessage(fromPhone,
+    `🐛 Creating *${summary.failedTests.length} GitHub issue(s)* for failed tests in *${repoName}*...\n⏳ Please wait...`
+  );
+
+  const createdIssues  = [];
+  const failedToCreate = [];
+
+  for (const test of summary.failedTests) {
+    try {
+      const issue = await createGitHubIssue(repo, test, runUrl);
+      createdIssues.push({ title: test.title, number: issue.number, url: issue.html_url });
+      console.log(`✅ Issue #${issue.number} created: ${test.title}`);
+    } catch (err) {
+      console.error(`❌ Failed to create issue for: ${test.title}`, err.message);
+      failedToCreate.push(test.title);
+    }
+  }
+
+  // Build response message
+  let responseMsg = `🐛 *GitHub Issues Created — ${repoName}*\n\n`;
+
+  if (createdIssues.length > 0) {
+    responseMsg += `✅ *Created ${createdIssues.length} issue(s):*\n`;
+    responseMsg += createdIssues.map(i =>
+      `• #${i.number} — ${i.title}\n  🔗 ${i.url}`
+    ).join("\n");
+  }
+
+  if (failedToCreate.length > 0) {
+    responseMsg += `\n\n⚠️ *Failed to create (${failedToCreate.length}):*\n`;
+    responseMsg += failedToCreate.map(t => `• ${t}`).join("\n");
+  }
+
+  responseMsg += `\n\n🔗 *All issues:* https://github.com/${repo.repo}/issues`;
+
+  addToHistory(fromPhone, "assistant", responseMsg);
+  await sendWhatsAppMessage(fromPhone, responseMsg);
+}
+
+// ─── Create a single GitHub Issue via REST API ────────────────────
+async function createGitHubIssue(repo, failedTest, runUrl) {
+  const url = `https://api.github.com/repos/${repo.repo}/issues`;
+
+  // Build issue body with full details
+  const body = `## 🐛 Failed Playwright Test
+
+**Test:** \`${failedTest.title}\`
+**File:** \`${failedTest.file || "unknown"}\`
+**Status:** ❌ Failed
+
+## Error Details
+
+\`\`\`
+${failedTest.error || "No error message captured"}
+\`\`\`
+
+## Run Details
+
+- **GitHub Actions Run:** ${runUrl}
+- **Repo:** ${repo.repo}
+- **Auto-created by:** WhatsApp QA Bot 🤖
+
+## Steps to Reproduce
+
+1. Run the test: \`npx playwright test --grep "${failedTest.title}"\`
+2. Check the error above
+3. Review the full run: ${runUrl}
+
+---
+*This issue was automatically created by the WhatsApp Test Automation Bot.*`;
+
+  const response = await axios.post(
+    url,
+    {
+      title:  `🐛 [Playwright] ${failedTest.title}`,
+      body,
+      labels: ["bug", "playwright", "automated"],
+    },
+    {
+      headers: {
+        Authorization:      `token ${GITHUB_TOKEN}`,
+        "X-GitHub-Api-Version": "2022-11-28",
+        "Content-Type":     "application/json",
+      },
+    }
+  );
+
+  return response.data;
+}
+
+// ─── Handle report questions with auto re-fetch ───────────────────
+async function handleReportQuestion(fromPhone, message) {
+  const report  = lastReports[fromPhone];
+  const isStale = !report || (Date.now() - report.fetchedAt > 30 * 60 * 1000);
+
+  if (isStale) {
+    if (!report?.repo) {
+      sessions[fromPhone] = { state: "awaiting_repo_selection", action: "status" };
+      await sendWhatsAppMessage(fromPhone,
+        `📊 Which repo's report should I fetch?\n\n${buildRepoMenu()}`
+      );
+      return;
+    }
+    await sendWhatsAppMessage(fromPhone,
+      `🔄 Re-fetching *${report.repo.name}* report from GitHub...`
+    );
+    await ensureReportLoaded(fromPhone, report.repo);
+  }
+
+  addToHistory(fromPhone, "user", message);
+  const answer = await generateAISummaryFromJSON(fromPhone, message);
+  addToHistory(fromPhone, "assistant", answer);
+  await sendWhatsAppMessage(fromPhone, answer);
+}
+
 // ─── Fetch & store JSON report from GitHub artifact ───────────────
-async function fetchAndStoreReport(fromPhone, repo) {
+async function ensureReportLoaded(fromPhone, repo) {
   try {
-    // Get latest run
+    console.log(`📥 Fetching report for ${repo.name}...`);
+
     const runsRes = await axios.get(
-      `https://api.github.com/repos/${repo.repo}/actions/runs?per_page=1`,
+      `https://api.github.com/repos/${repo.repo}/actions/runs?per_page=5&status=completed`,
       { headers: { Authorization: `token ${GITHUB_TOKEN}`, "X-GitHub-Api-Version": "2022-11-28" } }
     );
-    const run = runsRes.data.workflow_runs[0];
 
-    // Get artifacts for this run
+    const run = runsRes.data.workflow_runs[0];
+    if (!run) { console.log("⚠️ No completed runs"); return; }
+
     const artifactsRes = await axios.get(
       `https://api.github.com/repos/${repo.repo}/actions/runs/${run.id}/artifacts`,
       { headers: { Authorization: `token ${GITHUB_TOKEN}`, "X-GitHub-Api-Version": "2022-11-28" } }
     );
 
-    // Find json-report artifact
     const jsonArtifact = artifactsRes.data.artifacts.find(a => a.name === "json-report");
+
     if (!jsonArtifact) {
-      console.log("⚠️ No json-report artifact found");
+      console.log("⚠️ json-report artifact not found");
       lastReports[fromPhone] = {
-        repoName: repo.name,
-        runUrl: run.html_url,
-        conclusion: run.conclusion,
-        json: null,
+        repo, repoName: repo.name,
+        runUrl: run.html_url, conclusion: run.conclusion,
+        summary: null, fetchedAt: Date.now(),
       };
       return;
     }
 
-    // Download artifact zip
     const downloadRes = await axios.get(
       `https://api.github.com/repos/${repo.repo}/actions/artifacts/${jsonArtifact.id}/zip`,
-      {
-        headers: { Authorization: `token ${GITHUB_TOKEN}` },
-        responseType: "arraybuffer",
-        maxRedirects: 5,
-      }
+      { headers: { Authorization: `token ${GITHUB_TOKEN}` }, responseType: "arraybuffer", maxRedirects: 5 }
     );
 
-    // Parse zip to get JSON (using built-in Node.js)
     const { default: JSZip } = await import("jszip");
-    const zip  = await JSZip.loadAsync(downloadRes.data);
-    const file = zip.file("playwright-results.json");
-
-    if (!file) {
-      console.log("⚠️ playwright-results.json not found in zip");
-      return;
-    }
+    const zip     = await JSZip.loadAsync(downloadRes.data);
+    const file    = zip.file("playwright-results.json");
+    if (!file) { console.log("⚠️ JSON file not in zip"); return; }
 
     const jsonStr    = await file.async("string");
     const reportJson = JSON.parse(jsonStr);
-
-    // Extract structured summary from JSON
-    const summary = extractSummaryFromJSON(reportJson);
+    const summary    = extractSummaryFromJSON(reportJson);
 
     lastReports[fromPhone] = {
-      repoName:   repo.name,
-      runUrl:     run.html_url,
-      conclusion: run.conclusion,
-      summary,           // structured summary
-      fullJson:   reportJson, // full raw JSON for Gemini
+      repo, repoName: repo.name,
+      runUrl: run.html_url, conclusion: run.conclusion,
+      summary, fetchedAt: Date.now(),
     };
 
-    console.log(`✅ Report stored: ${summary.passed} passed, ${summary.failed} failed, ${summary.skipped} skipped`);
+    console.log(`✅ Report loaded: ${summary.passed}p ${summary.failed}f ${summary.skipped}s`);
 
   } catch (err) {
-    console.error("❌ fetchAndStoreReport error:", err.message);
+    console.error("❌ ensureReportLoaded error:", err.message);
   }
 }
 
 // ─── Extract structured data from Playwright JSON ─────────────────
 function extractSummaryFromJSON(report) {
   const summary = {
-    passed:       0,
-    failed:       0,
-    skipped:      0,
-    total:        0,
-    duration:     0,
-    failedTests:  [],   // { title, file, error }
-    skippedTests: [],   // { title, file }
-    passedTests:  [],   // { title, file }
-    allTests:     [],   // all test details
+    passed: 0, failed: 0, skipped: 0, total: 0, duration: 0,
+    failedTests: [], skippedTests: [], passedTests: [],
   };
 
-  // Playwright JSON structure: report.suites → suite.specs → spec.tests → test.results
   function processSuite(suite, filePath = "") {
     const file = suite.file || filePath;
-
     if (suite.specs) {
       for (const spec of suite.specs) {
         for (const test of spec.tests) {
-          const status = test.status || (test.results?.[0]?.status);
-          const error  = test.results?.[0]?.error?.message || null;
+          const status   = test.status || test.results?.[0]?.status;
+          const error    = test.results?.[0]?.error?.message || null;
           const duration = test.results?.[0]?.duration || 0;
-
-          const testInfo = {
-            title: spec.title,
-            file,
-            status,
-            duration,
-            error,
-          };
-
-          summary.allTests.push(testInfo);
           summary.duration += duration;
 
           if (status === "passed" || status === "expected") {
@@ -309,60 +413,39 @@ function extractSummaryFromJSON(report) {
         }
       }
     }
-
-    // Recurse into nested suites
-    if (suite.suites) {
-      for (const child of suite.suites) {
-        processSuite(child, file);
-      }
-    }
+    if (suite.suites) for (const child of suite.suites) processSuite(child, file);
   }
 
-  if (report.suites) {
-    for (const suite of report.suites) {
-      processSuite(suite);
-    }
-  }
-
+  if (report.suites) for (const suite of report.suites) processSuite(suite);
   summary.total    = summary.passed + summary.failed + summary.skipped;
-  summary.duration = Math.round(summary.duration / 1000); // convert to seconds
-
+  summary.duration = Math.round(summary.duration / 1000);
   return summary;
 }
 
-// ─── Answer any question about stored JSON report ─────────────────
+// ─── Answer any question using stored JSON report ─────────────────
 async function generateAISummaryFromJSON(fromPhone, userQuestion) {
   const report = lastReports[fromPhone];
-  if (!report) {
-    return "⚠️ No test report stored yet. Run tests first or check status!";
-  }
+  if (!report) return "⚠️ No report loaded. Run tests or check status first!";
 
   const { summary, repoName, runUrl, conclusion } = report;
 
-  // Build rich context for Gemini
-  const failedList  = summary?.failedTests?.map(t =>
-    `  • ${t.title} (${t.file})\n    Error: ${t.error || "unknown"}`
-  ).join("\n") || "None";
+  if (!summary) {
+    return (
+      `⚠️ JSON artifact not found for *${repoName}*.\n` +
+      `Make sure your workflow uploads a *json-report* artifact.\n🔗 ${runUrl}`
+    );
+  }
 
-  const skippedList = summary?.skippedTests?.map(t =>
-    `  • ${t.title} (${t.file})`
+  const failedList  = summary.failedTests.map(t =>
+    `  • ${t.title}\n    File: ${t.file}\n    Error: ${t.error || "unknown"}`
   ).join("\n") || "None";
-
-  const passedList  = summary?.passedTests?.slice(0, 10).map(t =>
-    `  • ${t.title}`
-  ).join("\n") || "None";
+  const skippedList = summary.skippedTests.map(t => `  • ${t.title} (${t.file})`).join("\n") || "None";
+  const passedList  = summary.passedTests.slice(0, 15).map(t => `  • ${t.title}`).join("\n") || "None";
 
   const context = `
-Playwright Test Report for *${repoName}*
-Status: ${conclusion}
-Run URL: ${runUrl}
-
-SUMMARY:
-- ✅ Passed:  ${summary?.passed || 0}
-- ❌ Failed:  ${summary?.failed || 0}
-- ⊝ Skipped: ${summary?.skipped || 0}
-- 📈 Total:   ${summary?.total || 0}
-- ⏱ Duration: ${summary?.duration || 0}s
+Playwright Report — *${repoName}*
+Status: ${conclusion} | URL: ${runUrl}
+✅ Passed: ${summary.passed} | ❌ Failed: ${summary.failed} | ⊝ Skipped: ${summary.skipped} | 📈 Total: ${summary.total} | ⏱ ${summary.duration}s
 
 FAILED TESTS:
 ${failedList}
@@ -370,74 +453,54 @@ ${failedList}
 SKIPPED TESTS:
 ${skippedList}
 
-PASSED TESTS (first 10):
-${passedList}
-`;
+PASSED TESTS (first 15):
+${passedList}`;
 
   try {
-    const prompt = `You are a QA expert assistant on WhatsApp.
-You have access to the following Playwright test report data:
+    const prompt = `You are a QA expert on WhatsApp. Use this Playwright report to answer the user's question.
 
 ${context}
 
 User question: "${userQuestion}"
 
-Answer the question accurately using the report data above.
-Use emojis and *bold* WhatsApp formatting. Max 300 words.
-If listing test names, format them as bullet points.
-Always include the GitHub run URL at the end.`;
+Answer accurately. Use emojis and *bold*. Max 300 words. End with the GitHub URL.`;
 
     const response = await axios.post(GEMINI_URL, {
       contents: [{ parts: [{ text: prompt }] }]
     });
-
     return response.data.candidates[0].content.parts[0].text.trim();
 
   } catch (err) {
-    console.error("❌ Gemini report Q&A error:", err.message);
-    // Fallback: answer directly from parsed data
+    console.error("❌ Gemini Q&A error:", err.message);
     return buildFallbackAnswer(userQuestion, summary, repoName, runUrl, conclusion);
   }
 }
 
-// ─── Fallback answer without Gemini ──────────────────────────────
+// ─── Fallback without Gemini ──────────────────────────────────────
 function buildFallbackAnswer(question, summary, repoName, runUrl, conclusion) {
   const lower = question.toLowerCase();
-
   if (lower.includes("skip")) {
-    const list = summary?.skippedTests?.map(t => `• ${t.title}`).join("\n") || "None";
-    return `⊝ *Skipped Tests in ${repoName}:*\n\n${list}\n\n🔗 ${runUrl}`;
+    return `⊝ *Skipped — ${repoName}:*\n\n${summary.skippedTests.map(t => `• ${t.title}`).join("\n") || "None"}\n\n🔗 ${runUrl}`;
   }
   if (lower.includes("fail")) {
-    const list = summary?.failedTests?.map(t =>
-      `• ${t.title}\n  ↳ ${t.error || "no error msg"}`
-    ).join("\n") || "None";
-    return `❌ *Failed Tests in ${repoName}:*\n\n${list}\n\n🔗 ${runUrl}`;
+    return `❌ *Failed — ${repoName}:*\n\n${summary.failedTests.map(t => `• ${t.title}\n  ↳ ${t.error || "no error"}`).join("\n") || "None"}\n\n🔗 ${runUrl}`;
   }
   if (lower.includes("pass")) {
-    const list = summary?.passedTests?.slice(0, 10).map(t => `• ${t.title}`).join("\n") || "None";
-    return `✅ *Passed Tests in ${repoName}:*\n\n${list}\n\n🔗 ${runUrl}`;
+    return `✅ *Passed — ${repoName}:*\n\n${summary.passedTests.slice(0, 10).map(t => `• ${t.title}`).join("\n") || "None"}\n\n🔗 ${runUrl}`;
   }
-
-  const emoji = conclusion === "success" ? "🟢" : "🔴";
-  return (
-    `${emoji} *${repoName} Results*\n\n` +
-    `✅ Passed:  ${summary?.passed || 0}\n` +
-    `❌ Failed:  ${summary?.failed || 0}\n` +
-    `⊝ Skipped: ${summary?.skipped || 0}\n` +
-    `📈 Total:   ${summary?.total || 0}\n\n` +
-    `🔗 ${runUrl}`
-  );
+  const e = conclusion === "success" ? "🟢" : "🔴";
+  return `${e} *${repoName}*\n✅ ${summary.passed} | ❌ ${summary.failed} | ⊝ ${summary.skipped} | 📈 ${summary.total}\n⏱ ${summary.duration}s\n\n🔗 ${runUrl}`;
 }
 
 // ─── Detect intent ────────────────────────────────────────────────
 async function detectIntent(message) {
   try {
-    const prompt = `Classify this WhatsApp message for a QA bot into one intent:
-- "run_tests" → trigger/run/execute/start tests
-- "ask_status" → check status/results of last run
-- "ask_report" → question about specific test details (which failed, skipped, errors, test names, duration)
-- "other" → general chat, greetings, QA questions
+    const prompt = `Classify this WhatsApp message for a QA bot:
+- "run_tests" → trigger/run/execute tests
+- "ask_status" → overall status/results of last run
+- "ask_report" → specific details (which failed/skipped, errors, test names, duration)
+- "create_issues" → create GitHub issues for failed tests
+- "other" → general chat, greetings, theory
 
 Message: "${message}"
 Reply with ONLY the intent word.`;
@@ -445,20 +508,20 @@ Reply with ONLY the intent word.`;
     const response = await axios.post(GEMINI_URL, {
       contents: [{ parts: [{ text: prompt }] }]
     });
-
     const intent = response.data.candidates[0].content.parts[0].text.trim().toLowerCase();
-    return ["run_tests", "ask_status", "ask_report"].includes(intent) ? intent : "other";
+    return ["run_tests", "ask_status", "ask_report", "create_issues"].includes(intent) ? intent : "other";
 
   } catch (err) {
     const lower = message.toLowerCase();
     if (lower.includes("run") || lower.includes("trigger") || lower.includes("execute")) return "run_tests";
     if (lower.includes("status") || lower.includes("result")) return "ask_status";
+    if (lower.includes("create issue") || lower.includes("raise issue") || lower.includes("log issue") || lower.includes("open issue")) return "create_issues";
     if (lower.includes("fail") || lower.includes("skip") || lower.includes("pass") || lower.includes("error") || lower.includes("which")) return "ask_report";
     return "other";
   }
 }
 
-// ─── Chat with Gemini (with history) ─────────────────────────────
+// ─── Chat with Gemini (conversation memory) ───────────────────────
 async function chatWithGemini(phone) {
   try {
     const history  = chatHistory[phone] || [];
@@ -467,28 +530,26 @@ async function chatWithGemini(phone) {
       { role: "model", parts: [{ text: "Understood! I'm your QA automation assistant. How can I help?" }] },
       ...history.map(msg => ({
         role:  msg.role === "user" ? "user" : "model",
-        parts: [{ text: msg.text }]
+        parts: [{ text: msg.text }],
       }))
     ];
-
     const response = await axios.post(GEMINI_URL, { contents });
     return response.data.candidates[0].content.parts[0].text.trim();
-
   } catch (err) {
     console.error("❌ Gemini chat error:", err.message);
     return "⚠️ I had trouble thinking just now. Could you rephrase? 😅";
   }
 }
 
-// ─── Monitor workflow + fetch JSON report when done ───────────────
+// ─── Monitor workflow + auto-store report ─────────────────────────
 async function checkWorkflowStatus(toPhone, repo) {
   try {
     console.log(`🔄 Monitoring ${repo.name}...`);
     await new Promise(resolve => setTimeout(resolve, 8000));
 
-    const url        = `https://api.github.com/repos/${repo.repo}/actions/runs?per_page=1`;
-    let maxAttempts  = 24;
-    let attempt      = 0;
+    const url       = `https://api.github.com/repos/${repo.repo}/actions/runs?per_page=1`;
+    let maxAttempts = 24;
+    let attempt     = 0;
 
     while (attempt < maxAttempts) {
       try {
@@ -496,29 +557,22 @@ async function checkWorkflowStatus(toPhone, repo) {
           headers: { Authorization: `token ${GITHUB_TOKEN}`, "X-GitHub-Api-Version": "2022-11-28" },
         });
         const run = response.data.workflow_runs[0];
-        console.log(`⏳ (${attempt + 1}/${maxAttempts}) ${repo.name}: ${run.status}/${run.conclusion}`);
+        console.log(`⏳ (${attempt + 1}/${maxAttempts}) ${run.status}/${run.conclusion}`);
 
         if (run.status === "completed") {
-          // Download and store full JSON report
-          await fetchAndStoreReport(toPhone, repo);
-
-          // Generate AI summary from JSON
-          const summary = await generateAISummaryFromJSON(toPhone, "Give me a complete summary of the test results");
+          await ensureReportLoaded(toPhone, repo);
+          const summary = await generateAISummaryFromJSON(toPhone,
+            "Give me a complete summary including failed and skipped tests"
+          );
           addToHistory(toPhone, "assistant", summary);
           await sendWhatsAppMessage(toPhone, summary);
-
-          // Tip: tell user they can ask more
-          await sendWhatsAppMessage(toPhone,
-            `💡 *Tip:* You can now ask me anything about these results!\n` +
-            `Examples:\n• "which tests failed?"\n• "why were tests skipped?"\n• "show me error messages"`
-          );
-          console.log("✅ Full AI summary sent!");
+          await sendWhatsAppMessage(toPhone, buildPostResultTip());
+          console.log("✅ Summary sent!");
           return;
         }
       } catch (e) {
         console.error("Polling error:", e.message);
       }
-
       attempt++;
       if (attempt < maxAttempts) await new Promise(r => setTimeout(r, 10000));
     }
@@ -534,12 +588,11 @@ async function checkWorkflowStatus(toPhone, repo) {
 // ─── Trigger GitHub workflow ──────────────────────────────────────
 async function triggerGitHubWorkflow(repo) {
   const url = `https://api.github.com/repos/${repo.repo}/actions/workflows/${repo.workflow}/dispatches`;
-  const response = await axios.post(
-    url,
-    { ref: repo.branch },
+  const res = await axios.post(
+    url, { ref: repo.branch },
     { headers: { Authorization: `token ${GITHUB_TOKEN}`, "X-GitHub-Api-Version": "2022-11-28" } }
   );
-  console.log("✅ Workflow triggered:", response.status);
+  console.log("✅ Workflow triggered:", res.status);
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────
@@ -565,23 +618,32 @@ function buildRepoMenu() {
   return REPOS.map(r => `${r.id}️⃣ *${r.name}*`).join("\n");
 }
 
+function buildPostResultTip() {
+  return (
+    `💡 *What would you like to do next?*\n\n` +
+    `• "which tests failed?" → see failed tests\n` +
+    `• "which were skipped?" → see skipped tests\n` +
+    `• "show error messages" → see errors\n` +
+    `• *"create issues"* → 🐛 create GitHub issues for failures\n` +
+    `• "run tests" → trigger again`
+  );
+}
+
 function buildHelpMessage() {
   return (
-    `🤖 *Your AI QA Bot — Commands*\n\n` +
-    `*Test Commands:*\n` +
-    `• "run tests" → pick repo & trigger\n` +
-    `• "status" → get latest results\n\n` +
+    `🤖 *Your AI QA Bot*\n\n` +
+    `*Run Tests:*\n• "run tests" → pick repo & trigger\n\n` +
+    `*Results:*\n• "status" → full summary\n\n` +
     `*Ask About Results:*\n` +
     `• "which tests failed?"\n` +
-    `• "which tests were skipped?"\n` +
-    `• "show me error messages"\n` +
-    `• "how long did tests take?"\n\n` +
-    `*Available Repos:*\n${buildRepoMenu()}\n\n` +
-    `*Utilities:*\n` +
-    `• "clear" → reset chat & report\n` +
-    `• "help" → show this menu\n\n` +
-    `💡 I remember your last *${MAX_HISTORY} messages!*\n` +
-    `📊 Full JSON report stored after each run!`
+    `• "which were skipped?"\n` +
+    `• "show error messages"\n` +
+    `• "how long did tests run?"\n\n` +
+    `*GitHub Issues:*\n` +
+    `• *"create issues"* → 🐛 auto-create issues for ALL failed tests\n\n` +
+    `*Repos:*\n${buildRepoMenu()}\n\n` +
+    `*Utilities:*\n• "clear" → reset\n• "help" → this menu\n\n` +
+    `♻️ Report always re-fetched from GitHub if missing!`
   );
 }
 
