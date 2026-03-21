@@ -541,47 +541,70 @@ async function chatWithGemini(phone) {
   }
 }
 
-// ─── Monitor workflow + auto-store report ─────────────────────────
+// ─── Monitor workflow — polls until done, no time limit ───────────
 async function checkWorkflowStatus(toPhone, repo) {
   try {
-    console.log(`🔄 Monitoring ${repo.name}...`);
-    await new Promise(resolve => setTimeout(resolve, 8000));
+    console.log(`🔄 Monitoring ${repo.name} — will poll until done...`);
 
-    const url       = `https://api.github.com/repos/${repo.repo}/actions/runs?per_page=1`;
-    let maxAttempts = 24;
-    let attempt     = 0;
+    // Wait for GitHub to register the new run
+    await new Promise(resolve => setTimeout(resolve, 10000));
 
-    while (attempt < maxAttempts) {
+    // Capture the run ID of the triggered run so we track the RIGHT one
+    const runsRes = await axios.get(
+      `https://api.github.com/repos/${repo.repo}/actions/runs?per_page=1`,
+      { headers: { Authorization: `token ${GITHUB_TOKEN}`, "X-GitHub-Api-Version": "2022-11-28" } }
+    );
+    const trackedRunId = runsRes.data.workflow_runs[0]?.id;
+    console.log(`🎯 Tracking run ID: ${trackedRunId}`);
+
+    let attempt = 0;
+
+    // ✅ Poll indefinitely every 30s until run completes
+    while (true) {
       try {
-        const response = await axios.get(url, {
-          headers: { Authorization: `token ${GITHUB_TOKEN}`, "X-GitHub-Api-Version": "2022-11-28" },
-        });
-        const run = response.data.workflow_runs[0];
-        console.log(`⏳ (${attempt + 1}/${maxAttempts}) ${run.status}/${run.conclusion}`);
+        await new Promise(r => setTimeout(r, 30000)); // wait 30s between checks
+
+        const response = await axios.get(
+          `https://api.github.com/repos/${repo.repo}/actions/runs/${trackedRunId}`,
+          { headers: { Authorization: `token ${GITHUB_TOKEN}`, "X-GitHub-Api-Version": "2022-11-28" } }
+        );
+
+        const run = response.data;
+        const elapsed = Math.round((attempt * 30) / 60); // minutes elapsed
+        console.log(`⏳ [${elapsed}m] ${repo.name}: ${run.status}/${run.conclusion || "in progress"}`);
 
         if (run.status === "completed") {
+          console.log(`✅ Run completed after ~${elapsed} mins!`);
+
+          // Fetch full JSON report
           await ensureReportLoaded(toPhone, repo);
+
+          // Generate AI summary
           const summary = await generateAISummaryFromJSON(toPhone,
-            "Give me a complete summary including failed and skipped tests"
+            "Give me a complete summary including all failed and skipped tests with details"
           );
           addToHistory(toPhone, "assistant", summary);
           await sendWhatsAppMessage(toPhone, summary);
           await sendWhatsAppMessage(toPhone, buildPostResultTip());
-          console.log("✅ Summary sent!");
+          console.log("✅ Final summary sent!");
           return;
         }
+
       } catch (e) {
-        console.error("Polling error:", e.message);
+        // Network hiccup — log and keep polling
+        console.error(`⚠️ Polling error (attempt ${attempt}):`, e.message);
       }
+
       attempt++;
-      if (attempt < maxAttempts) await new Promise(r => setTimeout(r, 10000));
     }
 
-    await sendWhatsAppMessage(toPhone,
-      `⏱️ *${repo.name}* still running after 4 mins\n🔗 https://github.com/${repo.repo}/actions`
-    );
   } catch (error) {
     console.error("❌ checkWorkflowStatus error:", error.message);
+    await sendWhatsAppMessage(toPhone,
+      `⚠️ Lost track of the *${repo.name}* run.\n\n` +
+      `Say *"status"* to manually fetch the latest results.\n` +
+      `🔗 https://github.com/${repo.repo}/actions`
+    );
   }
 }
 
