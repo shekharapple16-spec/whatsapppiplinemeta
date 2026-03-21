@@ -355,8 +355,7 @@ async function handleMessage(fromPhone, message) {
 
   // ─── INTENT: run tests ────────────────────────────────────────
   if (intent === "run_tests") {
-    const repo = detectRepo(message) || getLastRepo(fromPhone);
-    if (!repo) { sessions[fromPhone] = { state: "awaiting_repo", action: "run_tests" }; await send(fromPhone, `🚀 Which repo?\n\n${buildRepoMenu()}`); return; }
+    const repo = detectRepo(message) || getLastRepo(fromPhone) || REPOS[0];
     await startTestRun(fromPhone, repo);
     return;
   }
@@ -382,12 +381,7 @@ async function handleMessage(fromPhone, message) {
   }
 
   // ─── GENERAL: answer any repo question ───────────────────────
-  const repo = detectRepo(message) || getLastRepo(fromPhone);
-  if (!repo) {
-    sessions[fromPhone] = { state: "awaiting_repo", action: "general", pendingQuestion: message };
-    await send(fromPhone, `📂 Which repo?\n\n${buildRepoMenu()}`);
-    return;
-  }
+  const repo = detectRepo(message) || getLastRepo(fromPhone) || REPOS[0];
   await answerGeneralQuery(fromPhone, repo, message);
 }
 
@@ -406,13 +400,15 @@ async function startTestRun(fromPhone, repo) {
     return;
   }
 
+  // Wait for GitHub to register the triggered run
   await sleep(12000);
 
+  // Capture the exact run ID we just triggered (most recent)
   const runsRes      = await ghGet(`/repos/${repo.repo}/actions/runs?per_page=1`);
   const trackedRunId = runsRes.workflow_runs[0]?.id;
   if (!trackedRunId) { await send(fromPhone, "❌ Could not find the triggered run."); return; }
 
-  // polling silently
+  console.log(`🎯 Tracking exact run ID: ${trackedRunId}`);
 
   let attempt = 0;
   while (true) {
@@ -423,7 +419,8 @@ async function startTestRun(fromPhone, repo) {
       console.log(`⏳ [${elapsed}m] ${run.status}/${run.conclusion || "running"}`);
 
       if (run.status === "completed") {
-        await ensureReportLoaded(fromPhone, repo);
+        // Load report from the EXACT run we triggered, not the latest
+        await ensureReportLoadedForRun(fromPhone, repo, trackedRunId, run);
         const report = lastReports[fromPhone];
         await send(fromPhone, buildMinimalReport(report, run.html_url));
         addHistory(fromPhone, "assistant", `Test run completed for ${repo.name}.`);
@@ -624,6 +621,8 @@ async function handleExecutePR(fromPhone, prNumber) {
 
   if (!trackedRunId) { await send(fromPhone, `❌ Could not find the triggered run.`); return; }
 
+  console.log(`🎯 Tracking PR run ID: ${trackedRunId}`);
+
   let attempt = 0;
   while (true) {
     await sleep(30000);
@@ -633,7 +632,8 @@ async function handleExecutePR(fromPhone, prNumber) {
       console.log(`⏳ PR run [${elapsed}m]: ${run.status}/${run.conclusion || "running"}`);
 
       if (run.status === "completed") {
-        await ensureReportLoaded(fromPhone, repo);
+        // Load from exact run ID
+        await ensureReportLoadedForRun(fromPhone, repo, trackedRunId, run);
         const report = lastReports[fromPhone];
         const s      = report?.summary;
         const icon   = run.conclusion === "success" ? "🟢" : "🔴";
@@ -799,13 +799,60 @@ function buildPRBody(issueNumber, testTitle, testFile, error, geminiResult, runU
 //  PLAYWRIGHT REPORT LOADING
 // ════════════════════════════════════════════════════════════════════
 
+// Load report from a SPECIFIC run ID — not the latest, the exact one we triggered
+async function ensureReportLoadedForRun(fromPhone, repo, runId, run) {
+  try {
+    const artRes  = await ghGet(`/repos/${repo.repo}/actions/runs/${runId}/artifacts`);
+    const jsonArt = artRes.artifacts.find(a => a.name === "json-report");
+
+    if (!jsonArt) {
+      console.log(`⚠️ No json-report artifact in run #${runId}`);
+      lastReports[fromPhone] = { repo, repoName: repo.name, runUrl: run.html_url, conclusion: run.conclusion, summary: null, fetchedAt: Date.now() };
+      return;
+    }
+
+    const dlRes = await axios.get(
+      `https://api.github.com/repos/${repo.repo}/actions/artifacts/${jsonArt.id}/zip`,
+      { headers: { Authorization: `token ${GITHUB_TOKEN}` }, responseType: "arraybuffer", maxRedirects: 5 }
+    );
+    const { default: JSZip } = await import("jszip");
+    const zip  = await JSZip.loadAsync(dlRes.data);
+    const file = zip.file("playwright-results.json");
+    if (!file) { console.log("⚠️ playwright-results.json not found in zip"); return; }
+
+    const summary = extractSummary(JSON.parse(await file.async("string")));
+    lastReports[fromPhone] = { repo, repoName: repo.name, runUrl: run.html_url, conclusion: run.conclusion, summary, fetchedAt: Date.now() };
+    console.log(`✅ Report from run #${runId}: ${summary.passed}p ${summary.failed}f ${summary.skipped}s`);
+  } catch (err) {
+    console.error(`❌ ensureReportLoadedForRun(${runId}):`, err.message);
+  }
+}
+
 async function ensureReportLoaded(fromPhone, repo) {
   try {
-    const runsRes  = await ghGet(`/repos/${repo.repo}/actions/runs?per_page=5&status=completed`);
-    const run      = runsRes.workflow_runs[0];
-    if (!run) return;
-    const artRes   = await ghGet(`/repos/${repo.repo}/actions/runs/${run.id}/artifacts`);
-    const jsonArt  = artRes.artifacts.find(a => a.name === "json-report");
+    // Fetch last 10 runs and find the one that has a json-report artifact
+    const runsRes = await ghGet(`/repos/${repo.repo}/actions/runs?per_page=10&status=completed`);
+    const runs    = runsRes.workflow_runs || [];
+
+    let run      = null;
+    let jsonArt  = null;
+
+    for (const candidate of runs) {
+      const artRes = await ghGet(`/repos/${repo.repo}/actions/runs/${candidate.id}/artifacts`);
+      const found  = artRes.artifacts.find(a => a.name === "json-report");
+      if (found) {
+        run     = candidate;
+        jsonArt = found;
+        console.log(`✅ Found json-report in run #${run.id}`);
+        break;
+      }
+    }
+
+    if (!run) {
+      console.log("⚠️ No run with json-report found in last 10 runs");
+      return;
+    }
+
     if (!jsonArt) { lastReports[fromPhone] = { repo, repoName: repo.name, runUrl: run.html_url, conclusion: run.conclusion, summary: null, fetchedAt: Date.now() }; return; }
     const dlRes = await axios.get(
       `https://api.github.com/repos/${repo.repo}/actions/artifacts/${jsonArt.id}/zip`,
