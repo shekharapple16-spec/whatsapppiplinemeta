@@ -452,15 +452,17 @@ async function runAgent(phone, userMessage) {
     {
       role: "system",
       content:
-        `You are a precise QA automation assistant on WhatsApp for GitHub repos.\n` +
+        `You are a precise QA bot on WhatsApp for GitHub repos.\n` +
         `Available repos: ${REPOS.map(r => `${r.id}. ${r.name} (${r.repo})`).join(', ')}\n\n` +
-        `Rules:\n` +
-        `- Use tools to take real actions — don't just describe what you'll do\n` +
-        `- Be concise — max 3 sentences in final reply\n` +
-        `- No bullet point lists unless asked\n` +
-        `- For multi-step requests (run+fix+share): call tools in sequence\n` +
-        `- Always use repo_id 1 unless user specifies another repo\n` +
-        `- When fix_issue is called, the PR link arrives async — tell user to wait`,
+        `STRICT RULES:\n` +
+        `- Do ONLY what the user explicitly asks. Nothing more.\n` +
+        `- "run tests" → ONLY run tests. Do NOT create issues or fix anything.\n` +
+        `- "create issues" → ONLY create issues. Do NOT fix them.\n` +
+        `- "fix #N" → ONLY fix that issue. Do NOT run tests first.\n` +
+        `- ONLY chain multiple tools if user explicitly asks for all steps in one message.\n` +
+        `- Reply in max 2 lines. Be direct and factual.\n` +
+        `- No bullet lists unless showing multiple items.\n` +
+        `- Always use repo_id 1 unless user specifies another.`,
     },
     ...history,
     { role: "user", content: userMessage },
@@ -654,9 +656,8 @@ app.post("/webhook", async (req, res) => {
       console.log(`📱 [${fromPhone}]: ${messageBody}`);
       res.sendStatus(200);
 
-      // ── Instant acknowledgment so user knows bot received message ──
-      const ack = getAck(messageBody.trim());
-      if (ack) await send(fromPhone, ack);
+      // ── Instant Groq acknowledgment — 1 line, no tools ────────────
+      getGroqAck(messageBody.trim()).then(ack => { if (ack) send(fromPhone, ack); });
 
       runAgent(fromPhone, messageBody.trim())
         .then(reply => send(fromPhone, reply))
@@ -773,25 +774,38 @@ async function send(toPhone, message) {
   } catch (err) { console.error("❌ WhatsApp send:", err.response?.data||err.message); }
 }
 
-// ─── Instant acknowledgment based on message keywords ────────────
-function getAck(message) {
-  const l = message.toLowerCase();
-  if (l.includes("run test") || l.includes("trigger test") || l.includes("execute test"))
-    return "🚀 Running tests...";
-  if (l.includes("fix") && l.match(/#\d+/))
-    return "🔧 Fixing issue...";
-  if (l.includes("execute pr") || l.includes("run pr") || l.includes("verify pr"))
-    return "🧪 Running tests on PR...";
-  if (l.includes("create issue") || l.includes("log issue") || l.includes("raise issue"))
-    return "🔍 Checking existing issues...";
-  if (l.includes("merge pr") || l.includes("merge #"))
-    return "🔀 Merging PR...";
-  if (l.includes("cleanup") || l.includes("delete branch"))
-    return "🗑️ Cleaning up branches...";
-  if (l.includes("run") && (l.includes("fix") || l.includes("create issue") || l.includes("share pr")))
-    return "⚙️ Starting pipeline...";
-  // For any other message — show "checking..." so user knows bot is working
-  return "🔍 Checking...";
+// ─── Groq instant acknowledgment — called before agent runs ──────
+// Uses llama with NO tools, just returns 1 short line
+async function getGroqAck(message) {
+  try {
+    const res = await axios.post(GROQ_URL, {
+      model:      "llama-3.1-8b-instant", // smallest/fastest model for ack
+      messages: [
+        {
+          role: "system",
+          content:
+            "You are a WhatsApp QA bot. The user just sent a message. " +
+            "Reply with ONE short line (max 6 words) acknowledging you received it and are working on it. " +
+            "Use 1 relevant emoji. No punctuation at end. Examples:\n" +
+            "- 'run tests' → '🚀 Running tests now'\n" +
+            "- 'fix #160' → '🔧 Fixing issue #160'\n" +
+            "- 'show open issues' → '🔍 Fetching issues'\n" +
+            "- 'any open PRs' → '🔍 Checking PRs'\n" +
+            "- 'execute PR #3' → '🧪 Running PR #3 tests'\n" +
+            "- 'cleanup branches' → '🗑️ Cleaning branches'\n" +
+            "- 'merge PR #5' → '🔀 Merging PR #5'",
+        },
+        { role: "user", content: message },
+      ],
+      temperature: 0.3,
+      max_tokens:  20,
+    }, {
+      headers: { Authorization: `Bearer ${GROQ_API_KEY}`, "Content-Type": "application/json" },
+    });
+    return res.data.choices[0].message.content.trim();
+  } catch (_) {
+    return "🔍 On it..."; // fallback if Groq fails
+  }
 }
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
