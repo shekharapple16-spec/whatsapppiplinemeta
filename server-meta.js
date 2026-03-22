@@ -16,14 +16,13 @@ const META_PHONE_ID        = process.env.META_PHONE_ID;
 const META_API_TOKEN       = process.env.META_API_TOKEN;
 const WEBHOOK_VERIFY_TOKEN = process.env.WEBHOOK_VERIFY_TOKEN;
 const GITHUB_TOKEN         = process.env.GITHUB_TOKEN;
-const GEMINI_API_KEY       = process.env.GEMINI_API_KEY; // kept for fallback
 const GROQ_API_KEY         = process.env.GROQ_API_KEY;
 const BOT_WEBHOOK_URL      = process.env.BOT_WEBHOOK_URL;
 const BOT_WEBHOOK_SECRET   = process.env.BOT_WEBHOOK_SECRET;
 
 // ─── Groq API helper (OpenAI-compatible) ──────────────────────────
 // Uses llama-3.3-70b — fast, free, great at code, supports JSON mode
-const GROQ_MODEL = "llama-3.3-70b-versatile";//llama-3.3-70b-versatile
+const GROQ_MODEL = "llama-3.3-70b-versatile";
 
 async function callLLM(messages, jsonMode = false) {
   const payload = {
@@ -191,7 +190,7 @@ app.post("/ai-fix-callback", async (req, res) => {
 
 async function writeFixAndCreatePR(phone, repo, issueNumber, testTitle, testFile, testResult, artifacts, sourceFiles, runUrl, healerFixed = false, healerDiff = '', healerLog = '') {
   try {
-    let geminiResult;
+    let llmResult;
 
     if (healerFixed && healerDiff && healerDiff !== 'no diff') {
       // ── Playwright Healer already fixed it! ──────────────────────
@@ -240,40 +239,37 @@ Respond ONLY with valid JSON:
           else throw err;
         }
       }
-      geminiResult = JSON.parse(raw);
-      geminiResult.healerFixed = true;
+      llmResult = JSON.parse(raw);
+      llmResult.healerFixed = true;
 
     } else {
     // ── Smart token-efficient context building ────────────────────
-    // Extract ONLY what Gemini needs — not everything
-
     const error = testResult?.error || testResult?.failedTests?.[0]?.error || "No error captured";
 
-    // 1. Extract selectors the test uses → find only those DOM elements
-    const testContent  = sourceFiles?.[testFile] || sourceFiles?.[Object.keys(sourceFiles||{}).find(p => p.includes(testFile))] || "";
+    // Use rawErrorOutput (issue body) as additional context if source files empty
+    const issueBodyContext = artifacts?.rawErrorOutput?.length > 100
+      ? `\nISSUE BODY CONTEXT:\n${artifacts.rawErrorOutput.slice(0, 1500)}`
+      : "";
+
+    const testContent   = sourceFiles?.[testFile] ||
+      sourceFiles?.[Object.keys(sourceFiles||{}).find(p => p.includes(testFile))] || "";
+
     const usedSelectors = [
       ...[...testContent.matchAll(/(?:locator|getBy\w+|fill|click|waitFor(?:Selector)?)\s*\(\s*['"`]([^'"`]+)['"`]/g)].map(m => m[1]),
       ...[...testContent.matchAll(/#[\w-]+|\.[\w-]+|\[[\w-="']+\]/g)].map(m => m[0]),
     ].filter((v, i, a) => v.length > 2 && a.indexOf(v) === i).slice(0, 20);
 
-    // 2. Extract ONLY relevant DOM snippets (elements matching used selectors)
     const fullDom = artifacts?.domSnapshot || "";
     let relevantDom = "";
     if (fullDom && usedSelectors.length > 0) {
-      // Split DOM into lines, keep only lines containing our selectors
       const domLines = fullDom.split(/(?=<)/);
       const relevant = domLines.filter(line =>
-        usedSelectors.some(sel => {
-          const clean = sel.replace(/^[#.\[]/, "");
-          return line.includes(clean);
-        })
+        usedSelectors.some(sel => line.includes(sel.replace(/^[#.\[]/, "")))
       ).slice(0, 30);
       relevantDom = relevant.join("\n").slice(0, 2000);
     }
-    // Fallback: first 1500 chars of DOM if no selector match
     if (!relevantDom) relevantDom = fullDom.slice(0, 1500);
 
-    // 3. Only send the test file + its direct page object (not ALL files)
     const testFileContent = testContent.slice(0, 3000);
     const pageObjectFile  = Object.entries(sourceFiles || {}).find(([p]) =>
       p.includes("pages/") || p.includes("Page") || p.includes("page")
@@ -282,46 +278,52 @@ Respond ONLY with valid JSON:
       ? `FILE: ${pageObjectFile[0]}\n\`\`\`javascript\n${pageObjectFile[1].slice(0, 2000)}\n\`\`\``
       : "";
 
-    // 4. Build lean prompt — ~1000 tokens total
     const prompt = `Fix this failing Playwright test. Be precise and minimal.
 
 ERROR: ${error.slice(0, 500)}
 
 TEST FILE: ${testFile}
 \`\`\`javascript
-${testFileContent}
+${testFileContent || "File content not available — use issue body context below"}
 \`\`\`
 
 ${pageObjectCtx}
 
-RELEVANT DOM (elements the test interacts with):
+${relevantDom ? `RELEVANT DOM (elements the test interacts with):
 \`\`\`html
-${relevantDom || "Not available"}
-\`\`\`
+${relevantDom}
+\`\`\`` : ""}
+${issueBodyContext}
 
-SELECTORS USED IN TEST: ${usedSelectors.join(", ") || "see test file"}
+VALID FILE PATHS (use exactly — do not invent paths):
+${Object.keys(sourceFiles || {}).map(p => `- ${p}`).join("\n") || `- ${testFile}`}
 
-VALID FILE PATHS (use exactly):
-${Object.keys(sourceFiles || {}).map(p => `- ${p}`).join("\n")}
-
-Fix the root cause. Minimal change only.`;
+Respond with JSON:
+{
+  "prTitle": "fix: <what was wrong>",
+  "explanation": "<what was wrong and what you changed>",
+  "rootCause": "<one sentence>",
+  "fixes": [{ "path": "<exact path>", "message": "<commit message>", "content": "<complete fixed file>" }]
+}
+If cannot fix: { "prTitle": "", "explanation": "<reason>", "rootCause": "", "fixes": [] }`;
 
     // ── Gemini Structured Output ──────────────────────────────────
     // ── Call Groq (fast, free, OpenAI-compatible JSON mode) ───────
     console.log(`🧠 Calling Groq (llama-3.3-70b)...`);
-    const raw         = await callLLM([
-      { role: "system", content: "You are an expert Playwright test engineer. Respond ONLY with valid JSON matching the schema requested. No markdown, no explanation outside JSON." },
+    const raw = await callLLM([
+      { role: "system", content: "You are an expert Playwright test engineer. Respond ONLY with valid JSON. No markdown, no explanation outside JSON." },
       { role: "user",   content: prompt }
-    ], true); // json_object mode — always valid JSON
+    ], true);
 
-    const geminiResult = JSON.parse(raw);
-    console.log(`🧠 Fix: "${geminiResult.prTitle}" | ${geminiResult.fixes?.length || 0} file(s)`);
-    console.log(`🧠 Files: ${geminiResult.fixes?.map(f => f.path).join(', ')}`);
+    console.log(`🧠 Raw Groq response (first 300): ${raw.slice(0, 300)}`);
+    llmResult = JSON.parse(raw);
+    console.log(`🧠 Fix: "${llmResult.prTitle}" | ${llmResult.fixes?.length || 0} file(s)`);
+    console.log(`🧠 Files: ${llmResult.fixes?.map(f => f.path).join(', ')}`);
 
     } // end else (Groq path)
 
-    if (!geminiResult?.fixes?.length) {
-      await send(phone, `⚠️ Could not auto-fix issue #${issueNumber}.\nReason: ${geminiResult?.explanation || "Unknown"}\n🔗 ${runUrl}`);
+    if (!llmResult?.fixes?.length) {
+      await send(phone, `⚠️ Could not auto-fix issue #${issueNumber}.\nReason: ${llmResult?.explanation || "Unknown"}\n🔗 ${runUrl}`);
       return;
     }
 
@@ -353,7 +355,7 @@ Fix the root cause. Minimal change only.`;
       }
     }
 
-    for (const fix of geminiResult.fixes) {
+    for (const fix of llmResult.fixes) {
       console.log(`  📝 Committing: ${fix.path}`);
       try {
         // Validate: if path doesn't exist in repo, try to find the closest match
@@ -386,8 +388,8 @@ Fix the root cause. Minimal change only.`;
     console.log(`🔀 Creating PR...`);
     let pr;
     try {
-      const prBody = buildPRBody(issueNumber, testTitle, testFile, testResult?.error, geminiResult, runUrl, artifacts);
-      pr = await createPR(repo, branchName, repo.branch, geminiResult.prTitle, prBody, headers);
+      const prBody = buildPRBody(issueNumber, testTitle, testFile, testResult?.error, llmResult, runUrl, artifacts);
+      pr = await createPR(repo, branchName, repo.branch, llmResult.prTitle, prBody, headers);
       console.log(`✅ PR #${pr.number}: ${pr.html_url}`);
     } catch (err) {
       console.error(`❌ createPR failed: ${err.response?.status} ${JSON.stringify(err.response?.data)}`);
@@ -403,7 +405,7 @@ Fix the root cause. Minimal change only.`;
         `- 🖥️ Live DOM snapshot\n` +
         `- ❌ Exact error message\n\n` +
         `Gemini analysed this real data and opened a fix PR.\n\n` +
-        `**Root cause:** ${geminiResult.rootCause}\n\n` +
+        `**Root cause:** ${llmResult.rootCause}\n\n` +
         `**PR:** ${pr.html_url}\n\n` +
         `*Auto-actioned by WhatsApp QA Bot + Playwright Agent 🤖*`,
     });
@@ -638,11 +640,8 @@ async function handleCreateIssues(fromPhone) {
 // ════════════════════════════════════════════════════════════════════
 
 async function handleFixIssue(fromPhone, issueNumber) {
-  // Repo: use last known, or detect from message, or default to REPOS[0]
   const repo = getLastRepo(fromPhone) || REPOS[0];
   if (!issueNumber) { await send(fromPhone, `⚠️ Include the issue number. Example: *"fix issue #12"*`); return; }
-
-  // fetching issue silently
 
   let issue;
   try {
@@ -652,13 +651,21 @@ async function handleFixIssue(fromPhone, issueNumber) {
     return;
   }
 
-  // Extract test info from issue body
-  const testTitle = issue.title.replace("🐛 [Playwright] ", "").trim();
-  const testFile  = extractFileFromIssueBody(issue.body) || "tests/";
+  // Extract everything from issue body — it already has all the context
+  const testTitle  = issue.title.replace("🐛 [Playwright] ", "").trim();
+  const testFile   = extractFileFromIssueBody(issue.body)   || "tests/";
+  const errorMsg   = extractErrorFromIssueBody(issue.body)  || "";
+  const runUrl     = extractRunUrlFromIssueBody(issue.body) || `https://github.com/${repo.repo}/actions`;
+
+  console.log(`🔍 Issue #${issueNumber}: "${testTitle}" | file: ${testFile}`);
+  console.log(`   Error: ${errorMsg.slice(0, 100)}`);
 
   await send(fromPhone, `🔧 Fixing issue #${issueNumber}...`);
 
-  // Trigger the AI Fix Agent workflow
+  // Trigger GitHub Actions — it will run the test + capture live DOM
+  // and POST back to /ai-fix-callback with fresh data
+  // The issue body context (error, file) is passed as inputs so Actions
+  // knows exactly which test to run
   try {
     await axios.post(
       `https://api.github.com/repos/${repo.repo}/actions/workflows/${repo.aiFixWorkflow}/dispatches`,
@@ -675,15 +682,22 @@ async function handleFixIssue(fromPhone, issueNumber) {
     );
 
     console.log(`✅ AI Fix Agent triggered for issue #${issueNumber}`);
-
     await send(fromPhone, `⏳ Working on fix for issue #${issueNumber}... I'll send you the PR link when ready.`);
 
   } catch (err) {
     console.error("❌ Could not trigger AI Fix workflow:", err.message);
-    await send(fromPhone,
-      `⚠️ *Could not trigger AI Fix Agent.*\n\n` +
-      `Make sure \`ai-fix.yml\` is in your repo at \`.github/workflows/ai-fix.yml\`\n\n` +
-      `Error: ${err.message}`
+
+    // Fallback: if GitHub Actions fails, use issue body directly with Groq
+    // No need to re-run the test — we already have the error from the issue
+    console.log(`⚠️ Falling back to direct Groq fix using issue body...`);
+    await send(fromPhone, `⏳ Using issue details to generate fix...`);
+
+    await writeFixAndCreatePR(
+      fromPhone, repo, issueNumber, testTitle, testFile,
+      { passed: false, error: errorMsg, failedTests: [{ title: testTitle, error: errorMsg }] },
+      { screenshotBase64: '', domSnapshot: '', rawErrorOutput: issue.body },
+      {}, // source files — will be empty, Groq uses issue body
+      runUrl
     );
   }
 }
@@ -885,8 +899,8 @@ async function createGitHubIssue(repo, failedTest, runUrl) {
   return res.data;
 }
 
-function buildPRBody(issueNumber, testTitle, testFile, error, geminiResult, runUrl, artifacts) {
-  const files   = geminiResult.fixes.map(f => `- \`${f.path}\``).join("\n");
+function buildPRBody(issueNumber, testTitle, testFile, error, llmResult, runUrl, artifacts) {
+  const files   = llmResult.fixes.map(f => `- \`${f.path}\``).join("\n");
   const hasReal = artifacts?.screenshotBase64 || artifacts?.domSnapshot;
   return (
     `## 🤖 AI Auto-Fix (Playwright Agent)\n\n` +
@@ -897,8 +911,8 @@ function buildPRBody(issueNumber, testTitle, testFile, error, geminiResult, runU
     (hasReal
       ? `A Playwright agent ran the **real test** in GitHub Actions and captured:\n- 📸 Screenshot of actual page at failure\n- 🖥️ Live DOM snapshot (real selectors)\n- 📁 All source + page object files\n\nGemini analysed this **real browser data** to write the fix.\n\n`
       : `Gemini analysed the error + source code to write the fix.\n\n`) +
-    `### 🧠 Root Cause\n${geminiResult.rootCause}\n\n` +
-    `### 🔧 What Was Fixed\n${geminiResult.explanation}\n\n` +
+    `### 🧠 Root Cause\n${llmResult.rootCause}\n\n` +
+    `### 🔧 What Was Fixed\n${llmResult.explanation}\n\n` +
     `### 📝 Files Changed\n${files}\n\n` +
     `### 🔗 Failing Run\n${runUrl}\n\n` +
     `---\n> ⚠️ Review carefully before merging.\n> After merging say *"execute PR #${"{PR_NUMBER}"}"* on WhatsApp to verify.\n\n` +
