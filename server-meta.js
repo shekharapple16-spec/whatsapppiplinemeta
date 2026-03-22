@@ -20,7 +20,7 @@ const GEMINI_API_KEY       = process.env.GEMINI_API_KEY;
 const BOT_WEBHOOK_URL      = process.env.BOT_WEBHOOK_URL;   // your Render URL e.g. https://your-bot.onrender.com
 const BOT_WEBHOOK_SECRET   = process.env.BOT_WEBHOOK_SECRET; // random secret shared with GitHub Actions
 
-const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp:generateContent?key=${GEMINI_API_KEY}`;
+const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`;
 
 // ─── Repo Config ──────────────────────────────────────────────────
 const REPOS = [
@@ -311,9 +311,11 @@ If you cannot determine a safe fix from the available data, return:
     let geminiRes;
     for (let attempt = 0; attempt < 4; attempt++) {
       try {
+        console.log(`🧠 Calling Gemini (attempt ${attempt + 1})...`);
         geminiRes = await axios.post(GEMINI_URL, geminiPayload);
         break;
       } catch (err) {
+        console.error(`❌ Gemini error (attempt ${attempt + 1}): ${err.response?.status} ${err.response?.data?.error?.message || err.message}`);
         if (err.response?.status === 429 && attempt < 3) {
           const wait = (attempt + 1) * 15000;
           console.log(`⏳ Gemini 429 — retrying in ${wait/1000}s (attempt ${attempt + 1})`);
