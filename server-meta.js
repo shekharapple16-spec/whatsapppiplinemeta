@@ -16,11 +16,46 @@ const META_PHONE_ID        = process.env.META_PHONE_ID;
 const META_API_TOKEN       = process.env.META_API_TOKEN;
 const WEBHOOK_VERIFY_TOKEN = process.env.WEBHOOK_VERIFY_TOKEN;
 const GITHUB_TOKEN         = process.env.GITHUB_TOKEN;
-const GEMINI_API_KEY       = process.env.GEMINI_API_KEY;
-const BOT_WEBHOOK_URL      = process.env.BOT_WEBHOOK_URL;   // your Render URL e.g. https://your-bot.onrender.com
-const BOT_WEBHOOK_SECRET   = process.env.BOT_WEBHOOK_SECRET; // random secret shared with GitHub Actions
+const GEMINI_API_KEY       = process.env.GEMINI_API_KEY; // kept for fallback
+const GROQ_API_KEY         = process.env.GROQ_API_KEY;
+const BOT_WEBHOOK_URL      = process.env.BOT_WEBHOOK_URL;
+const BOT_WEBHOOK_SECRET   = process.env.BOT_WEBHOOK_SECRET;
 
-const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`;
+// ─── Groq API helper (OpenAI-compatible) ──────────────────────────
+// Uses llama-3.3-70b — fast, free, great at code, supports JSON mode
+const GROQ_MODEL = "llama-3.3-70b-versatile";//llama-3.3-70b-versatile
+
+async function callLLM(messages, jsonMode = false) {
+  const payload = {
+    model:       GROQ_MODEL,
+    messages,
+    temperature: 0.1,
+    max_tokens:  4096,
+    ...(jsonMode && { response_format: { type: "json_object" } }),
+  };
+
+  for (let attempt = 0; attempt < 4; attempt++) {
+    try {
+      const res = await axios.post(GROQ_URL, payload, {
+        headers: {
+          Authorization:  `Bearer ${GROQ_API_KEY}`,
+          "Content-Type": "application/json",
+        },
+      });
+      return res.data.choices[0].message.content.trim();
+    } catch (err) {
+      const status = err.response?.status;
+      console.error(`❌ Groq error (attempt ${attempt+1}): ${status} ${err.response?.data?.error?.message || err.message}`);
+      if ((status === 429 || status === 503) && attempt < 3) {
+        const wait = (attempt + 1) * 10000;
+        console.log(`⏳ Rate limited — retrying in ${wait/1000}s`);
+        await new Promise(r => setTimeout(r, wait));
+      } else throw err;
+    }
+  }
+}
+
+const GROQ_URL = "https://api.groq.com/openai/v1/chat/completions";
 
 // ─── Repo Config ──────────────────────────────────────────────────
 const REPOS = [
@@ -192,19 +227,19 @@ Respond ONLY with valid JSON:
   ]
 }`;
 
-      let geminiRes;
+      let raw;
       for (let attempt = 0; attempt < 4; attempt++) {
         try {
-          geminiRes = await axios.post(GEMINI_URL, { contents: [{ parts: [{ text: diffPrompt }] }] });
+          raw = await callLLM([
+            { role: "system", content: "You are an expert Playwright engineer. Respond ONLY with valid JSON." },
+            { role: "user",   content: diffPrompt }
+          ], true);
           break;
         } catch (err) {
-          if (err.response?.status === 429 && attempt < 3) {
-            await new Promise(r => setTimeout(r, (attempt + 1) * 15000));
-          } else throw err;
+          if (attempt < 3) await new Promise(r => setTimeout(r, (attempt+1) * 10000));
+          else throw err;
         }
       }
-      let raw = geminiRes.data.candidates[0].content.parts[0].text.trim();
-      raw = raw.replace(/^```json\s*/i, "").replace(/^```\s*/i, "").replace(/```$/i, "").trim();
       geminiResult = JSON.parse(raw);
       geminiResult.healerFixed = true;
 
@@ -272,67 +307,18 @@ ${Object.keys(sourceFiles || {}).map(p => `- ${p}`).join("\n")}
 Fix the root cause. Minimal change only.`;
 
     // ── Gemini Structured Output ──────────────────────────────────
-    // Using responseSchema forces Gemini to ALWAYS return valid JSON
-    // No more parsing errors, no truncation issues
-    const geminiSchema = {
-      type: "object",
-      properties: {
-        prTitle:     { type: "string" },
-        explanation: { type: "string" },
-        rootCause:   { type: "string" },
-        fixes: {
-          type: "array",
-          items: {
-            type: "object",
-            properties: {
-              path:    { type: "string" },
-              message: { type: "string" },
-              content: { type: "string" },
-            },
-            required: ["path", "message", "content"],
-          },
-        },
-      },
-      required: ["prTitle", "explanation", "rootCause", "fixes"],
-    };
+    // ── Call Groq (fast, free, OpenAI-compatible JSON mode) ───────
+    console.log(`🧠 Calling Groq (llama-3.3-70b)...`);
+    const raw         = await callLLM([
+      { role: "system", content: "You are an expert Playwright test engineer. Respond ONLY with valid JSON matching the schema requested. No markdown, no explanation outside JSON." },
+      { role: "user",   content: prompt }
+    ], true); // json_object mode — always valid JSON
 
-    // ── Gemini Structured Output — text only, no screenshot ──────
-    // Screenshot removed: saves ~50K tokens, DOM snippets are sufficient
-    const geminiPayload = {
-      contents: [{ parts: [{ text: prompt }] }],
-      generationConfig: {
-        responseMimeType: "application/json",
-        responseSchema:   geminiSchema,
-        temperature:      0.1,
-        maxOutputTokens:  4096,
-      },
-    };
-
-    // Call Gemini with retry on 429
-    let geminiRes;
-    for (let attempt = 0; attempt < 4; attempt++) {
-      try {
-        console.log(`🧠 Calling Gemini (attempt ${attempt + 1})...`);
-        geminiRes = await axios.post(GEMINI_URL, geminiPayload);
-        break;
-      } catch (err) {
-        console.error(`❌ Gemini error: ${err.response?.status} ${err.response?.data?.error?.message || err.message}`);
-        if (err.response?.status === 429 && attempt < 3) {
-          const wait = (attempt + 1) * 15000;
-          console.log(`⏳ Rate limited — retrying in ${wait/1000}s`);
-          await new Promise(r => setTimeout(r, wait));
-        } else { throw err; }
-      }
-    }
-
-    // With responseSchema, this is ALWAYS valid JSON — no parsing dance needed
-    const raw         = geminiRes.data.candidates[0].content.parts[0].text.trim();
     const geminiResult = JSON.parse(raw);
-
-    console.log(`🧠 Gemini fix: "${geminiResult.prTitle}" | ${geminiResult.fixes?.length || 0} file(s)`);
+    console.log(`🧠 Fix: "${geminiResult.prTitle}" | ${geminiResult.fixes?.length || 0} file(s)`);
     console.log(`🧠 Files: ${geminiResult.fixes?.map(f => f.path).join(', ')}`);
 
-    } // end else (Gemini path)
+    } // end else (Groq path)
 
     if (!geminiResult?.fixes?.length) {
       await send(phone, `⚠️ Could not auto-fix issue #${issueNumber}.\nReason: ${geminiResult?.explanation || "Unknown"}\n🔗 ${runUrl}`);
@@ -818,8 +804,10 @@ async function answerGeneralQuery(fromPhone, repo, question) {
     `Answer accurately and in detail. Use emojis and *bold* WhatsApp formatting.`;
 
   try {
-    const response = await axios.post(GEMINI_URL, { contents: [{ parts: [{ text: prompt }] }] });
-    const answer   = response.data.candidates[0].content.parts[0].text.trim();
+    const answer = await callLLM([
+      { role: "system", content: "You are an expert QA engineer and GitHub assistant on WhatsApp. Use emojis and *bold* WhatsApp formatting. Be accurate and detailed." },
+      { role: "user",   content: prompt }
+    ]);
     addHistory(fromPhone, "user", question);
     addHistory(fromPhone, "assistant", answer);
     await send(fromPhone, answer);
@@ -1083,8 +1071,10 @@ async function detectIntent(message) {
       `- "any open PRs" → general\n\n` +
       `Message: "${message}"\n\n` +
       `If in doubt → reply "general"`;
-    const res    = await axios.post(GEMINI_URL, { contents: [{ parts: [{ text: prompt }] }] });
-    const intent = res.data.candidates[0].content.parts[0].text.trim().toLowerCase().split(/\s/)[0];
+    const intent = (await callLLM([
+      { role: "system", content: "You are an intent classifier. Reply with ONLY one word." },
+      { role: "user",   content: prompt }
+    ])).toLowerCase().split(/\s/)[0];
     return ["run_tests","create_issues","fix_issue","execute_pr"].includes(intent) ? intent : "general";
   } catch (_) {
     const l = message.toLowerCase();
