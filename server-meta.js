@@ -653,6 +653,11 @@ app.post("/webhook", async (req, res) => {
       if (!messageBody) return res.sendStatus(200);
       console.log(`📱 [${fromPhone}]: ${messageBody}`);
       res.sendStatus(200);
+
+      // ── Instant acknowledgment so user knows bot received message ──
+      const ack = getAck(messageBody.trim());
+      if (ack) await send(fromPhone, ack);
+
       runAgent(fromPhone, messageBody.trim())
         .then(reply => send(fromPhone, reply))
         .catch(err => console.error("❌ Agent error:", err.message));
@@ -766,6 +771,27 @@ async function send(toPhone, message) {
       { headers: { Authorization: `Bearer ${META_API_TOKEN}`, "Content-Type": "application/json" } }
     );
   } catch (err) { console.error("❌ WhatsApp send:", err.response?.data||err.message); }
+}
+
+// ─── Instant acknowledgment based on message keywords ────────────
+function getAck(message) {
+  const l = message.toLowerCase();
+  if (l.includes("run test") || l.includes("trigger test") || l.includes("execute test"))
+    return "🚀 Running tests...";
+  if (l.includes("fix") && l.match(/#\d+/))
+    return "🔧 Fixing issue...";
+  if (l.includes("execute pr") || l.includes("run pr") || l.includes("verify pr"))
+    return "🧪 Running tests on PR...";
+  if (l.includes("create issue") || l.includes("log issue") || l.includes("raise issue"))
+    return "🔍 Checking existing issues...";
+  if (l.includes("merge pr") || l.includes("merge #"))
+    return "🔀 Merging PR...";
+  if (l.includes("cleanup") || l.includes("delete branch"))
+    return "🗑️ Cleaning up branches...";
+  if (l.includes("run") && (l.includes("fix") || l.includes("create issue") || l.includes("share pr")))
+    return "⚙️ Starting pipeline...";
+  // For any other message — show "checking..." so user knows bot is working
+  return "🔍 Checking...";
 }
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
