@@ -460,6 +460,12 @@ async function handleMessage(fromPhone, message) {
   const intent = await detectIntent(message);
   console.log(`🤖 Intent: ${intent} | Message: "${message}"`);
 
+  // ─── INTENT: full pipeline (run + create issues + fix) ───────
+  if (intent === "full_pipeline") {
+    await handleFullPipeline(fromPhone);
+    return;
+  }
+
   // ─── INTENT: run tests ────────────────────────────────────────
   if (intent === "run_tests") {
     const repo = detectRepo(message) || getLastRepo(fromPhone) || REPOS[0];
@@ -490,6 +496,57 @@ async function handleMessage(fromPhone, message) {
   // ─── GENERAL: answer any repo question ───────────────────────
   const repo = detectRepo(message) || getLastRepo(fromPhone) || REPOS[0];
   await answerGeneralQuery(fromPhone, repo, message);
+}
+
+// ════════════════════════════════════════════════════════════════════
+//  FULL PIPELINE — run tests → create issues → fix all → share PRs
+// ════════════════════════════════════════════════════════════════════
+
+async function handleFullPipeline(fromPhone) {
+  const repo = getLastRepo(fromPhone) || REPOS[0];
+  await send(fromPhone, `🚀 Starting full pipeline for *${repo.name}*...\n\n1️⃣ Running tests\n2️⃣ Creating issues for failures\n3️⃣ AI fixing each issue\n4️⃣ Sharing PR links`);
+
+  // Step 1: Run tests
+  await startTestRun(fromPhone, repo);
+
+  // Step 2: Create issues for failed tests (startTestRun updates lastReports)
+  const report = lastReports[fromPhone];
+  if (!report?.summary?.failedTests?.length) {
+    await send(fromPhone, `🎉 All tests passed! No issues to create or fix.`);
+    return;
+  }
+
+  await send(fromPhone, `\n2️⃣ *Creating issues for ${report.summary.failedTests.length} failed test(s)...*`);
+  await handleCreateIssues(fromPhone);
+
+  // Step 3: Fix each failed test
+  // Fetch the newly created issues
+  await new Promise(r => setTimeout(r, 3000)); // wait for issues to be created
+  const openIssues = await ghGet(`/repos/${repo.repo}/issues?state=open&labels=playwright&per_page=20`);
+
+  if (!openIssues.length) {
+    await send(fromPhone, `⚠️ Could not find created issues to fix.`);
+    return;
+  }
+
+  await send(fromPhone, `\n3️⃣ *AI fixing ${openIssues.length} issue(s)...*\n⏳ This will take a few minutes per issue.`);
+
+  const prLinks = [];
+  for (const issue of openIssues.slice(0, 3)) { // max 3 to avoid timeout
+    console.log(`🔧 Pipeline fixing issue #${issue.number}: ${issue.title}`);
+    // Store PR link when created — we'll collect from callback
+    await handleFixIssue(fromPhone, issue.number);
+    await new Promise(r => setTimeout(r, 2000)); // small delay between triggers
+  }
+
+  await send(fromPhone,
+    `✅ *Pipeline complete!*\n\n` +
+    `Tests ran ✅\n` +
+    `Issues created ✅\n` +
+    `AI fix agents triggered ✅\n\n` +
+    `🔗 PRs will be sent automatically as each fix completes.\n` +
+    `Check: https://github.com/${repo.repo}/pulls`
+  );
 }
 
 // ════════════════════════════════════════════════════════════════════
@@ -887,13 +944,25 @@ async function createPR(repo, head, base, title, body, headers) {
 }
 
 async function createGitHubIssue(repo, failedTest, runUrl) {
+  // Store everything Groq needs to fix this accurately:
+  // - exact test title (for grep)
+  // - exact file path (for reading)
+  // - full error + stack trace
+  // - run URL (for trace/artifacts)
   const body =
     `## 🐛 Failed Playwright Test\n\n` +
     `**Test:** \`${failedTest.title}\`\n` +
-    `**File:** \`${failedTest.file || "unknown"}\`\n\n` +
+    `**File:** \`${failedTest.file || "unknown"}\`\n` +
+    `**Repo:** \`${repo.repo}\`\n\n` +
     `## Error\n\`\`\`\n${failedTest.error || "No error captured"}\n\`\`\`\n\n` +
-    `## Run\n${runUrl}\n\n` +
+    `## How to reproduce\n` +
+    `\`\`\`bash\nnpx playwright test --grep "${failedTest.title}"\n\`\`\`\n\n` +
+    `## Run Details\n` +
+    `- **Actions Run:** ${runUrl}\n` +
+    `- **Test file:** \`${failedTest.file || "unknown"}\`\n` +
+    `- **Error type:** ${failedTest.error?.split('\n')[0] || "unknown"}\n\n` +
     `---\n*Auto-created by WhatsApp QA Bot 🤖*`;
+
   const res = await axios.post(
     `https://api.github.com/repos/${repo.repo}/issues`,
     { title: `🐛 [Playwright] ${failedTest.title}`, body, labels: ["bug", "playwright", "automated"] },
@@ -1077,7 +1146,13 @@ async function detectIntent(message) {
       `- "create_issues"  → ONLY if user explicitly says "create issues", "raise issues", "log issues", "open issues" — NOT questions about issues\n` +
       `- "fix_issue"      → ONLY if user says fix issue #N with a number\n` +
       `- "execute_pr"     → ONLY if user says execute/run/test PR #N with a number\n` +
-      `- "general"        → EVERYTHING else: questions, details, show me, what failed, why, how, list, status, results, info about anything\n\n` +
+      `- "full_pipeline"  → user wants ALL of: run tests + create issues + fix + share PR in one request\n` +
+      `- "general"        → EVERYTHING else: questions, details, show me, what failed, why, how, list, status\n\n` +
+      `EXAMPLES of "full_pipeline":\n` +
+      `- "run tests and if any failed create issues and fix them and share PR"\n` +
+      `- "run tests, fix failures and share PR"\n` +
+      `- "do everything - run, create issues, fix"\n` +
+      `- "run tests and fix all failures"\n\n` +
       `EXAMPLES of "general" (not actions):\n` +
       `- "details for failed test cases" → general\n` +
       `- "show failed tests" → general\n` +
@@ -1092,10 +1167,10 @@ async function detectIntent(message) {
       { role: "system", content: "You are an intent classifier. Reply with ONLY one word." },
       { role: "user",   content: prompt }
     ])).toLowerCase().split(/\s/)[0];
-    return ["run_tests","create_issues","fix_issue","execute_pr"].includes(intent) ? intent : "general";
+    return ["run_tests","create_issues","fix_issue","execute_pr","full_pipeline"].includes(intent) ? intent : "general";
   } catch (_) {
     const l = message.toLowerCase();
-    // Very strict fallback — only exact phrases trigger actions
+    if (l.includes("run") && (l.includes("fix") || l.includes("create issue") || l.includes("share pr"))) return "full_pipeline";
     if (l.match(/^run tests?$/) || l.match(/^trigger tests?$/) || l.match(/^execute tests?$/)) return "run_tests";
     if (l.match(/^create issues?/) || l.match(/^raise issues?/) || l.match(/^log issues?/) || l.match(/^open issues? for/)) return "create_issues";
     if (l.match(/fix issue\s*#\d+/i)) return "fix_issue";
@@ -1111,7 +1186,13 @@ function extractNumber(message) {
 
 function extractFileFromIssueBody(body = "") {
   const match = body.match(/\*\*File:\*\*\s*`([^`]+)`/);
-  return match ? match[1] : null;
+  if (!match) return null;
+  const filePath = match[1];
+  // If path doesn't start with tests/ add it
+  if (!filePath.startsWith('tests/') && !filePath.startsWith('./')) {
+    return `tests/${filePath}`;
+  }
+  return filePath;
 }
 
 function extractErrorFromIssueBody(body = "") {
