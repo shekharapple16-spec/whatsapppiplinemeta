@@ -209,9 +209,14 @@ Respond ONLY with valid JSON:
       geminiResult.healerFixed = true;
 
     } else {
-    // Build source context for Gemini
+    // Build source context — limit size to avoid token cutoff
+    // Test file gets full content, others get 1500 chars
     const sourceCtx = Object.entries(sourceFiles || {})
-      .map(([path, content]) => `FILE: ${path}\n\`\`\`javascript\n${content.slice(0, 3000)}\n\`\`\``)
+      .map(([p, c]) => {
+        const isTestFile = p === testFile || p.includes(testFile);
+        const limit      = isTestFile ? 5000 : 1500;
+        return `FILE: ${p}\n\`\`\`javascript\n${c.slice(0, limit)}\n\`\`\``;
+      })
       .join("\n\n");
 
     // Build DOM context
@@ -287,23 +292,19 @@ If you cannot determine a safe fix from the available data, return:
     // Call Gemini — include screenshot as image if available
     let geminiPayload;
     if (hasScreenshot) {
-      // Gemini 2.5 Flash supports multimodal — send text + image
       geminiPayload = {
         contents: [{
           parts: [
             { text: prompt },
-            {
-              inline_data: {
-                mime_type: "image/png",
-                data: artifacts.screenshotBase64,
-              }
-            }
+            { inline_data: { mime_type: "image/png", data: artifacts.screenshotBase64 } }
           ]
-        }]
+        }],
+        generationConfig: { maxOutputTokens: 8192, temperature: 0.1 },
       };
     } else {
       geminiPayload = {
-        contents: [{ parts: [{ text: prompt }] }]
+        contents: [{ parts: [{ text: prompt }] }],
+        generationConfig: { maxOutputTokens: 8192, temperature: 0.1 },
       };
     }
 
@@ -325,10 +326,38 @@ If you cannot determine a safe fix from the available data, return:
     }
     let raw = geminiRes.data.candidates[0].content.parts[0].text.trim();
     raw = raw.replace(/^```json\s*/i, "").replace(/^```\s*/i, "").replace(/```$/i, "").trim();
-    geminiResult = JSON.parse(raw);
+
+    // Handle truncated JSON — try to recover
+    let geminiResult;
+    try {
+      geminiResult = JSON.parse(raw);
+    } catch (parseErr) {
+      console.error(`❌ JSON parse error: ${parseErr.message}`);
+      console.log(`Raw response (first 500): ${raw.slice(0, 500)}`);
+
+      // Try to extract partial JSON — at minimum get prTitle and explanation
+      const titleMatch = raw.match(/"prTitle"\s*:\s*"([^"]+)"/);
+      const explMatch  = raw.match(/"explanation"\s*:\s*"([^"]+)"/);
+      const causeMatch = raw.match(/"rootCause"\s*:\s*"([^"]+)"/);
+
+      if (titleMatch) {
+        // Gemini had content but JSON was cut off — ask it to just give fixes more concisely
+        console.log(`⚠️ Truncated JSON detected — retrying with concise mode`);
+        const concisePrompt = `${prompt}\n\nIMPORTANT: Your previous response was truncated. Keep file content SHORT — only include the changed lines with minimal context. Max 50 lines per file.`;
+        const retryRes = await axios.post(GEMINI_URL, {
+          contents: [{ parts: [{ text: concisePrompt }] }],
+          generationConfig: { maxOutputTokens: 4096, temperature: 0.1 },
+        });
+        let retryRaw = retryRes.data.candidates[0].content.parts[0].text.trim();
+        retryRaw = retryRaw.replace(/^```json\s*/i, "").replace(/^```\s*/i, "").replace(/```$/i, "").trim();
+        geminiResult = JSON.parse(retryRaw);
+      } else {
+        throw new Error(`Gemini returned invalid JSON: ${parseErr.message}`);
+      }
+    }
+
     console.log(`🧠 Gemini fix: "${geminiResult.prTitle}" | ${geminiResult.fixes?.length || 0} file(s)`);
     console.log(`🧠 Gemini file paths: ${geminiResult.fixes?.map(f => f.path).join(', ')}`);
-    } // end else (Gemini path)
 
     if (!geminiResult?.fixes?.length) {
       await send(phone, `⚠️ Could not auto-fix issue #${issueNumber}.\nReason: ${geminiResult?.explanation || "Unknown"}\n🔗 ${runUrl}`);
@@ -1171,3 +1200,4 @@ async function send(toPhone, message) {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
+}
