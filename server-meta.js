@@ -279,9 +279,18 @@ If you cannot determine a safe fix from the available data, return:
     }
 
     const safeName   = testTitle.replace(/[^a-zA-Z0-9]/g, "-").slice(0, 40).toLowerCase();
-    const branchName = `ai-fix-issue-${issueNumber}-${safeName}`;
+    const branchName = `ai-fix-issue-${issueNumber}-${safeName}-${Date.now()}`;
 
-    await createBranch(repo, branchName, branchSHA, headers);
+    try {
+      await createBranch(repo, branchName, branchSHA, headers);
+    } catch (err) {
+      // Branch might already exist — delete and recreate
+      if (err.response?.status === 422) {
+        console.log(`⚠️ Branch exists, using new timestamp name`);
+      } else {
+        throw err;
+      }
+    }
 
     for (const fix of geminiResult.fixes) {
       await commitFile(repo, branchName, fix.path, fix.content, fix.message, headers);
@@ -316,7 +325,7 @@ If you cannot determine a safe fix from the available data, return:
 
   } catch (err) {
     console.error("❌ writeFixAndCreatePR error:", err.message);
-    await send(phone, `❌ Something went wrong writing the fix: ${err.message}`);
+    await send(phone, `❌ Fix failed: ${err.response?.status || ""} ${err.response?.data?.message || err.message}`);
   }
 }
 
@@ -459,10 +468,18 @@ function buildMinimalReport(report, runUrl) {
 // ════════════════════════════════════════════════════════════════════
 
 async function handleCreateIssues(fromPhone) {
-  const report = lastReports[fromPhone];
-  if (!report?.summary) { await send(fromPhone, `⚠️ No report loaded. Say *"run tests"* first.`); return; }
+  const repo = getLastRepo(fromPhone) || REPOS[0];
 
-  const { summary, repoName, runUrl, repo } = report;
+  // Auto-fetch report if not loaded
+  if (!lastReports[fromPhone]?.summary) {
+    await send(fromPhone, `🔍 Fetching latest test results...`);
+    await ensureReportLoaded(fromPhone, repo);
+  }
+
+  const report = lastReports[fromPhone];
+  if (!report?.summary) { await send(fromPhone, `⚠️ Could not load test report. Try *"run tests"* first.`); return; }
+
+  const { summary, repoName, runUrl } = report;
   if (!summary.failedTests?.length) { await send(fromPhone, `🎉 No failed tests in *${repoName}*! ✅`); return; }
 
   // checking existing issues silently
@@ -528,8 +545,8 @@ async function handleCreateIssues(fromPhone) {
 // ════════════════════════════════════════════════════════════════════
 
 async function handleFixIssue(fromPhone, issueNumber) {
-  const repo = getLastRepo(fromPhone);
-  if (!repo) { await send(fromPhone, `⚠️ I don't know which repo to use. Run tests first.`); return; }
+  // Repo: use last known, or detect from message, or default to REPOS[0]
+  const repo = getLastRepo(fromPhone) || REPOS[0];
   if (!issueNumber) { await send(fromPhone, `⚠️ Include the issue number. Example: *"fix issue #12"*`); return; }
 
   // fetching issue silently
@@ -583,8 +600,7 @@ async function handleFixIssue(fromPhone, issueNumber) {
 // ════════════════════════════════════════════════════════════════════
 
 async function handleExecutePR(fromPhone, prNumber) {
-  const repo = getLastRepo(fromPhone);
-  if (!repo)    { await send(fromPhone, `⚠️ Run tests first so I know which repo.`); return; }
+  const repo = getLastRepo(fromPhone) || REPOS[0];
   if (!prNumber){ await send(fromPhone, `⚠️ Include PR number. Example: *"execute PR #3"*`); return; }
 
   // fetching PR silently
