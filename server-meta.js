@@ -1,6 +1,9 @@
 import dotenv from "dotenv";
 import express from "express";
 import axios from "axios";
+import { createRequire } from "module";
+const require = createRequire(import.meta.url);
+const path    = require("path");
 
 dotenv.config();
 
@@ -121,6 +124,9 @@ app.post("/ai-fix-callback", async (req, res) => {
       testResult,    // { passed, error, failedTests }
       artifacts,     // { screenshotBase64, domSnapshot, traceFiles }
       sourceFiles,   // { 'tests/day3/login.spec.js': '...', 'pages/LoginPage.js': '...' }
+      healerFixed,   // true if Playwright Healer already fixed the test
+      healerDiff,    // git diff of what healer changed
+      healerLog,     // healer's reasoning
     } = req.body;
 
     console.log(`\n🤖 AI Fix callback received — Issue #${issueNumber} for ${phone}`);
@@ -137,7 +143,7 @@ app.post("/ai-fix-callback", async (req, res) => {
 
     // Now call Gemini with the REAL context from the Playwright agent
     const repo = getLastRepo(phone) || REPOS[0];
-    await writeFixAndCreatePR(phone, repo, issueNumber, testTitle, testFile, testResult, artifacts, sourceFiles, runUrl);
+    await writeFixAndCreatePR(phone, repo, issueNumber, testTitle, testFile, testResult, artifacts, sourceFiles, runUrl, healerFixed, healerDiff, healerLog);
 
   } catch (err) {
     console.error("❌ ai-fix-callback error:", err.message);
@@ -148,8 +154,61 @@ app.post("/ai-fix-callback", async (req, res) => {
 //  CORE: Gemini writes fix from REAL Playwright agent data → PR
 // ════════════════════════════════════════════════════════════════════
 
-async function writeFixAndCreatePR(phone, repo, issueNumber, testTitle, testFile, testResult, artifacts, sourceFiles, runUrl) {
+async function writeFixAndCreatePR(phone, repo, issueNumber, testTitle, testFile, testResult, artifacts, sourceFiles, runUrl, healerFixed = false, healerDiff = '', healerLog = '') {
   try {
+    let geminiResult;
+
+    if (healerFixed && healerDiff && healerDiff !== 'no diff') {
+      // ── Playwright Healer already fixed it! ──────────────────────
+      // Convert the git diff into file fixes for committing
+      console.log(`🎭 Healer fixed the test! Converting diff to commits...`);
+
+      // Ask Gemini to parse the diff and produce full file contents
+      const diffPrompt = `The Playwright Healer agent has already fixed a failing test. Here is the git diff of what it changed:
+
+\`\`\`diff
+${healerDiff.slice(0, 6000)}
+\`\`\`
+
+Source files for context:
+${Object.entries(sourceFiles || {}).map(([p, c]) => `FILE: ${p}\n\`\`\`\n${c.slice(0, 2000)}\n\`\`\``).join('\n\n')}
+
+The healer's reasoning:
+${healerLog?.slice(0, 1000) || 'Not available'}
+
+Based on the diff above, produce the COMPLETE fixed file content for each changed file.
+
+Respond ONLY with valid JSON:
+{
+  "prTitle": "fix: <what the healer fixed>",
+  "explanation": "<what was wrong and what the healer changed>",
+  "rootCause": "<one sentence root cause>",
+  "fixes": [
+    {
+      "path": "relative/path/to/file.js",
+      "message": "fix: <what changed>",
+      "content": "<COMPLETE file content>"
+    }
+  ]
+}`;
+
+      let geminiRes;
+      for (let attempt = 0; attempt < 4; attempt++) {
+        try {
+          geminiRes = await axios.post(GEMINI_URL, { contents: [{ parts: [{ text: diffPrompt }] }] });
+          break;
+        } catch (err) {
+          if (err.response?.status === 429 && attempt < 3) {
+            await new Promise(r => setTimeout(r, (attempt + 1) * 15000));
+          } else throw err;
+        }
+      }
+      let raw = geminiRes.data.candidates[0].content.parts[0].text.trim();
+      raw = raw.replace(/^```json\s*/i, "").replace(/^```\s*/i, "").replace(/```$/i, "").trim();
+      geminiResult = JSON.parse(raw);
+      geminiResult.healerFixed = true;
+
+    } else {
     // Build source context for Gemini
     const sourceCtx = Object.entries(sourceFiles || {})
       .map(([path, content]) => `FILE: ${path}\n\`\`\`javascript\n${content.slice(0, 3000)}\n\`\`\``)
@@ -200,6 +259,13 @@ INSTRUCTIONS
 3. Write the COMPLETE fixed file content — not a diff, the full file
 4. Only change what is necessary — minimal targeted fix
 5. Check page objects in pages/ — the fix may need to go there instead of the test
+
+⚠️ CRITICAL — FILE PATHS:
+You MUST use ONLY these exact file paths (copy exactly as shown, do not invent new paths):
+${Object.keys(sourceFiles || {}).map(p => `  - ${p}`).join('\n')}
+
+Do NOT use paths like "src/pages/X" if the actual path is "pages/X".
+The path in your response must exactly match one of the paths listed above.
 
 Respond ONLY with valid JSON (no markdown fences, no extra text):
 {
@@ -257,8 +323,10 @@ If you cannot determine a safe fix from the available data, return:
     }
     let raw = geminiRes.data.candidates[0].content.parts[0].text.trim();
     raw = raw.replace(/^```json\s*/i, "").replace(/^```\s*/i, "").replace(/```$/i, "").trim();
-    const geminiResult = JSON.parse(raw);
+    geminiResult = JSON.parse(raw);
     console.log(`🧠 Gemini fix: "${geminiResult.prTitle}" | ${geminiResult.fixes?.length || 0} file(s)`);
+    console.log(`🧠 Gemini file paths: ${geminiResult.fixes?.map(f => f.path).join(', ')}`);
+    } // end else (Gemini path)
 
     if (!geminiResult?.fixes?.length) {
       await send(phone, `⚠️ Could not auto-fix issue #${issueNumber}.\nReason: ${geminiResult?.explanation || "Unknown"}\n🔗 ${runUrl}`);
@@ -281,25 +349,58 @@ If you cannot determine a safe fix from the available data, return:
     const safeName   = testTitle.replace(/[^a-zA-Z0-9]/g, "-").slice(0, 40).toLowerCase();
     const branchName = `ai-fix-issue-${issueNumber}-${safeName}-${Date.now()}`;
 
+    console.log(`🌿 Creating branch: ${branchName}`);
     try {
       await createBranch(repo, branchName, branchSHA, headers);
     } catch (err) {
-      // Branch might already exist — delete and recreate
       if (err.response?.status === 422) {
-        console.log(`⚠️ Branch exists, using new timestamp name`);
+        console.log(`⚠️ Branch exists already`);
       } else {
+        console.error(`❌ createBranch failed: ${err.response?.status} ${JSON.stringify(err.response?.data)}`);
         throw err;
       }
     }
 
     for (const fix of geminiResult.fixes) {
-      await commitFile(repo, branchName, fix.path, fix.content, fix.message, headers);
-      console.log(`  📝 Committed: ${fix.path}`);
+      console.log(`  📝 Committing: ${fix.path}`);
+      try {
+        // Validate: if path doesn't exist in repo, try to find the closest match
+        // from the source files we already know about
+        const knownPaths   = Object.keys(sourceFiles || {});
+        const fixPathLower = fix.path.toLowerCase().replace(/\\/g, '/');
+
+        // Check if Gemini's path matches a known file (exact or partial)
+        const matchedPath = knownPaths.find(p => {
+          const pLower = p.toLowerCase().replace(/\\/g, '/');
+          return pLower === fixPathLower ||
+                 pLower.endsWith('/' + fixPathLower) ||
+                 fixPathLower.endsWith('/' + pLower) ||
+                 path.basename(pLower) === path.basename(fixPathLower);
+        });
+
+        if (matchedPath && matchedPath !== fix.path) {
+          console.log(`  🔧 Path corrected: "${fix.path}" → "${matchedPath}"`);
+          fix.path = matchedPath;
+        }
+
+        await commitFile(repo, branchName, fix.path, fix.content, fix.message, headers);
+        console.log(`  ✅ Committed: ${fix.path}`);
+      } catch (err) {
+        console.error(`  ❌ commitFile failed for ${fix.path}: ${err.response?.status} ${JSON.stringify(err.response?.data)}`);
+        throw err;
+      }
     }
 
-    const prBody = buildPRBody(issueNumber, testTitle, testFile, testResult?.error, geminiResult, runUrl, artifacts);
-    const pr     = await createPR(repo, branchName, repo.branch, geminiResult.prTitle, prBody, headers);
-    console.log(`✅ PR #${pr.number}: ${pr.html_url}`);
+    console.log(`🔀 Creating PR...`);
+    let pr;
+    try {
+      const prBody = buildPRBody(issueNumber, testTitle, testFile, testResult?.error, geminiResult, runUrl, artifacts);
+      pr = await createPR(repo, branchName, repo.branch, geminiResult.prTitle, prBody, headers);
+      console.log(`✅ PR #${pr.number}: ${pr.html_url}`);
+    } catch (err) {
+      console.error(`❌ createPR failed: ${err.response?.status} ${JSON.stringify(err.response?.data)}`);
+      throw err;
+    }
 
     // Comment on the issue linking to PR
     await ghPost(`/repos/${repo.repo}/issues/${issueNumber}/comments`, {
@@ -325,7 +426,7 @@ If you cannot determine a safe fix from the available data, return:
 
   } catch (err) {
     console.error("❌ writeFixAndCreatePR error:", err.message);
-    await send(phone, `❌ Fix failed: ${err.response?.status || ""} ${err.response?.data?.message || err.message}`);
+    await send(phone, `❌ Fix failed (${err.response?.status || ""}): ${err.response?.data?.message || err.message}`);
   }
 }
 
