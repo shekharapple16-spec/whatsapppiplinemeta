@@ -20,7 +20,7 @@ const GEMINI_API_KEY       = process.env.GEMINI_API_KEY;
 const BOT_WEBHOOK_URL      = process.env.BOT_WEBHOOK_URL;   // your Render URL e.g. https://your-bot.onrender.com
 const BOT_WEBHOOK_SECRET   = process.env.BOT_WEBHOOK_SECRET; // random secret shared with GitHub Actions
 
-const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`;
+const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemma-3-27b-it:generateContent?key=${GEMINI_API_KEY}`;
 
 // ─── Repo Config ──────────────────────────────────────────────────
 const REPOS = [
