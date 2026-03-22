@@ -20,7 +20,7 @@ const GEMINI_API_KEY       = process.env.GEMINI_API_KEY;
 const BOT_WEBHOOK_URL      = process.env.BOT_WEBHOOK_URL;   // your Render URL e.g. https://your-bot.onrender.com
 const BOT_WEBHOOK_SECRET   = process.env.BOT_WEBHOOK_SECRET; // random secret shared with GitHub Actions
 
-const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemma-3-27b-it:generateContent?key=${GEMINI_API_KEY}`;
+const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`;
 
 // ─── Repo Config ──────────────────────────────────────────────────
 const REPOS = [
@@ -209,85 +209,67 @@ Respond ONLY with valid JSON:
       geminiResult.healerFixed = true;
 
     } else {
-    // Build source context — limit size to avoid token cutoff
-    // Test file gets full content, others get 1500 chars
-    const sourceCtx = Object.entries(sourceFiles || {})
-      .map(([p, c]) => {
-        const isTestFile = p === testFile || p.includes(testFile);
-        const limit      = isTestFile ? 5000 : 1500;
-        return `FILE: ${p}\n\`\`\`javascript\n${c.slice(0, limit)}\n\`\`\``;
-      })
-      .join("\n\n");
+    // ── Smart token-efficient context building ────────────────────
+    // Extract ONLY what Gemini needs — not everything
 
-    // Build DOM context
-    const domCtx = artifacts?.domSnapshot
-      ? `DOM SNAPSHOT (actual page HTML when test failed):\n\`\`\`html\n${artifacts.domSnapshot.slice(0, 6000)}\n\`\`\``
-      : "No DOM snapshot available.";
+    const error = testResult?.error || testResult?.failedTests?.[0]?.error || "No error captured";
 
-    // Screenshot note — Gemini 2.5 Flash supports image input
-    // We include it if available
-    const hasScreenshot = artifacts?.screenshotBase64?.length > 100;
+    // 1. Extract selectors the test uses → find only those DOM elements
+    const testContent  = sourceFiles?.[testFile] || sourceFiles?.[Object.keys(sourceFiles||{}).find(p => p.includes(testFile))] || "";
+    const usedSelectors = [
+      ...[...testContent.matchAll(/(?:locator|getBy\w+|fill|click|waitFor(?:Selector)?)\s*\(\s*['"`]([^'"`]+)['"`]/g)].map(m => m[1]),
+      ...[...testContent.matchAll(/#[\w-]+|\.[\w-]+|\[[\w-="']+\]/g)].map(m => m[0]),
+    ].filter((v, i, a) => v.length > 2 && a.indexOf(v) === i).slice(0, 20);
 
-    const prompt = `You are an expert Playwright test automation engineer.
-
-A GitHub Actions Playwright agent has just run the REAL failing test in a live browser and captured the following data. Use this REAL data (not guesses) to write a precise fix.
-
-════════════════════════════════════
-FAILING TEST
-════════════════════════════════════
-Title : "${testTitle}"
-File  : ${testFile}
-Error :
-${testResult?.error || testResult?.failedTests?.[0]?.error || "No error captured"}
-
-Run URL: ${runUrl}
-
-════════════════════════════════════
-SOURCE FILES (read directly from repo)
-════════════════════════════════════
-${sourceCtx || "No source files available."}
-
-════════════════════════════════════
-LIVE DOM SNAPSHOT (actual page state when test failed)
-Use this to check if selectors in the test match the real page structure.
-Look for: correct element IDs, class names, roles, text content.
-════════════════════════════════════
-${domCtx}
-
-${hasScreenshot ? "A screenshot of the page at failure time has been captured (attached as image)." : ""}
-
-════════════════════════════════════
-INSTRUCTIONS
-════════════════════════════════════
-1. Compare selectors in the test file against the REAL DOM above
-2. Identify the exact root cause (wrong selector? timing? missing await? wrong assertion?)
-3. Write the COMPLETE fixed file content — not a diff, the full file
-4. Only change what is necessary — minimal targeted fix
-5. Check page objects in pages/ — the fix may need to go there instead of the test
-
-⚠️ CRITICAL — FILE PATHS:
-You MUST use ONLY these exact file paths (copy exactly as shown, do not invent new paths):
-${Object.keys(sourceFiles || {}).map(p => `  - ${p}`).join('\n')}
-
-Do NOT use paths like "src/pages/X" if the actual path is "pages/X".
-The path in your response must exactly match one of the paths listed above.
-
-Respond ONLY with valid JSON (no markdown fences, no extra text):
-{
-  "prTitle": "fix: <short description of what was wrong>",
-  "explanation": "<3-4 sentences: exactly what was wrong based on the real DOM/error, and what you changed>",
-  "rootCause": "<one sentence root cause>",
-  "fixes": [
-    {
-      "path": "relative/path/to/file.js",
-      "message": "fix: <what changed in this file>",
-      "content": "<COMPLETE file content with fix applied>"
+    // 2. Extract ONLY relevant DOM snippets (elements matching used selectors)
+    const fullDom = artifacts?.domSnapshot || "";
+    let relevantDom = "";
+    if (fullDom && usedSelectors.length > 0) {
+      // Split DOM into lines, keep only lines containing our selectors
+      const domLines = fullDom.split(/(?=<)/);
+      const relevant = domLines.filter(line =>
+        usedSelectors.some(sel => {
+          const clean = sel.replace(/^[#.\[]/, "");
+          return line.includes(clean);
+        })
+      ).slice(0, 30);
+      relevantDom = relevant.join("\n").slice(0, 2000);
     }
-  ]
-}
+    // Fallback: first 1500 chars of DOM if no selector match
+    if (!relevantDom) relevantDom = fullDom.slice(0, 1500);
 
-If you cannot determine a safe fix from the available data, return:
-{ "fixes": [], "explanation": "<reason>", "prTitle": "", "rootCause": "" }`;
+    // 3. Only send the test file + its direct page object (not ALL files)
+    const testFileContent = testContent.slice(0, 3000);
+    const pageObjectFile  = Object.entries(sourceFiles || {}).find(([p]) =>
+      p.includes("pages/") || p.includes("Page") || p.includes("page")
+    );
+    const pageObjectCtx = pageObjectFile
+      ? `FILE: ${pageObjectFile[0]}\n\`\`\`javascript\n${pageObjectFile[1].slice(0, 2000)}\n\`\`\``
+      : "";
+
+    // 4. Build lean prompt — ~1000 tokens total
+    const prompt = `Fix this failing Playwright test. Be precise and minimal.
+
+ERROR: ${error.slice(0, 500)}
+
+TEST FILE: ${testFile}
+\`\`\`javascript
+${testFileContent}
+\`\`\`
+
+${pageObjectCtx}
+
+RELEVANT DOM (elements the test interacts with):
+\`\`\`html
+${relevantDom || "Not available"}
+\`\`\`
+
+SELECTORS USED IN TEST: ${usedSelectors.join(", ") || "see test file"}
+
+VALID FILE PATHS (use exactly):
+${Object.keys(sourceFiles || {}).map(p => `- ${p}`).join("\n")}
+
+Fix the root cause. Minimal change only.`;
 
     // ── Gemini Structured Output ──────────────────────────────────
     // Using responseSchema forces Gemini to ALWAYS return valid JSON
@@ -314,18 +296,15 @@ If you cannot determine a safe fix from the available data, return:
       required: ["prTitle", "explanation", "rootCause", "fixes"],
     };
 
-    const parts = [{ text: prompt }];
-    if (hasScreenshot) {
-      parts.push({ inline_data: { mime_type: "image/png", data: artifacts.screenshotBase64 } });
-    }
-
+    // ── Gemini Structured Output — text only, no screenshot ──────
+    // Screenshot removed: saves ~50K tokens, DOM snippets are sufficient
     const geminiPayload = {
-      contents: [{ parts }],
+      contents: [{ parts: [{ text: prompt }] }],
       generationConfig: {
-        responseMimeType: "application/json",  // ← forces JSON output
-        responseSchema:   geminiSchema,         // ← enforces exact shape
+        responseMimeType: "application/json",
+        responseSchema:   geminiSchema,
         temperature:      0.1,
-        maxOutputTokens:  8192,
+        maxOutputTokens:  4096,
       },
     };
 
