@@ -1064,21 +1064,31 @@ async function detectIntent(message) {
     const prompt =
       `Classify this WhatsApp message for a GitHub QA bot. Reply with ONLY the intent word.\n\n` +
       `Intents:\n` +
-      `- "run_tests"      → run/trigger/execute/start tests\n` +
-      `- "create_issues"  → create/log/raise issues for failed tests\n` +
-      `- "fix_issue"      → fix issue #N / ai fix / resolve issue\n` +
-      `- "execute_pr"     → execute/run/test/verify PR #N\n` +
-      `- "general"        → everything else\n\n` +
-      `Message: "${message}"`;
+      `- "run_tests"      → ONLY if user explicitly says run/trigger/execute/start tests\n` +
+      `- "create_issues"  → ONLY if user explicitly says "create issues", "raise issues", "log issues", "open issues" — NOT questions about issues\n` +
+      `- "fix_issue"      → ONLY if user says fix issue #N with a number\n` +
+      `- "execute_pr"     → ONLY if user says execute/run/test PR #N with a number\n` +
+      `- "general"        → EVERYTHING else: questions, details, show me, what failed, why, how, list, status, results, info about anything\n\n` +
+      `EXAMPLES of "general" (not actions):\n` +
+      `- "details for failed test cases" → general\n` +
+      `- "show failed tests" → general\n` +
+      `- "what tests failed" → general\n` +
+      `- "why did login test fail" → general\n` +
+      `- "show me issues" → general\n` +
+      `- "list open issues" → general\n` +
+      `- "any open PRs" → general\n\n` +
+      `Message: "${message}"\n\n` +
+      `If in doubt → reply "general"`;
     const res    = await axios.post(GEMINI_URL, { contents: [{ parts: [{ text: prompt }] }] });
-    const intent = res.data.candidates[0].content.parts[0].text.trim().toLowerCase();
+    const intent = res.data.candidates[0].content.parts[0].text.trim().toLowerCase().split(/\s/)[0];
     return ["run_tests","create_issues","fix_issue","execute_pr"].includes(intent) ? intent : "general";
   } catch (_) {
     const l = message.toLowerCase();
-    if (l.includes("run test") || l.includes("trigger") || l.includes("execute test")) return "run_tests";
-    if (l.includes("create issue") || l.includes("log issue") || l.includes("raise issue")) return "create_issues";
-    if (l.match(/fix issue\s*#?\d+/i) || l.includes("ai fix")) return "fix_issue";
-    if (l.match(/execute pr\s*#?\d+/i) || l.match(/run pr\s*#?\d+/i)) return "execute_pr";
+    // Very strict fallback — only exact phrases trigger actions
+    if (l.match(/^run tests?$/) || l.match(/^trigger tests?$/) || l.match(/^execute tests?$/)) return "run_tests";
+    if (l.match(/^create issues?/) || l.match(/^raise issues?/) || l.match(/^log issues?/) || l.match(/^open issues? for/)) return "create_issues";
+    if (l.match(/fix issue\s*#\d+/i)) return "fix_issue";
+    if (l.match(/execute pr\s*#\d+/i) || l.match(/run pr\s*#\d+/i)) return "execute_pr";
     return "general";
   }
 }
