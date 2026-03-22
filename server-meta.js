@@ -122,14 +122,17 @@ app.post("/webhook", async (req, res) => {
       const messageBody = body.entry[0].changes[0].value.messages[0].text?.body;
       if (!messageBody) return res.sendStatus(200);
       console.log(`📱 [${fromPhone}]: ${messageBody}`);
-      res.sendStatus(200);
-      await handleMessage(fromPhone, messageBody.trim());
+      res.sendStatus(200); // always respond to Meta immediately
+      // handle message async — errors here won't affect the response
+      handleMessage(fromPhone, messageBody.trim()).catch(err => {
+        console.error("❌ handleMessage error:", err.message);
+      });
     } else {
       res.sendStatus(200);
     }
   } catch (err) {
     console.error("❌ Webhook error:", err.message);
-    res.sendStatus(500);
+    if (!res.headersSent) res.sendStatus(500);
   }
 });
 
@@ -1109,6 +1112,17 @@ function extractNumber(message) {
 function extractFileFromIssueBody(body = "") {
   const match = body.match(/\*\*File:\*\*\s*`([^`]+)`/);
   return match ? match[1] : null;
+}
+
+function extractErrorFromIssueBody(body = "") {
+  // Extract content between ``` in the Error section
+  const match = body.match(/## Error\s*```[\s\S]*?\n([\s\S]*?)```/);
+  return match ? match[1].trim() : null;
+}
+
+function extractRunUrlFromIssueBody(body = "") {
+  const match = body.match(/https:\/\/github\.com\/[^\s)]+\/actions\/runs\/\d+/);
+  return match ? match[0] : null;
 }
 
 function detectRepo(message) {
