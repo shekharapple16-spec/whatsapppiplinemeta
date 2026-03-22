@@ -18,7 +18,7 @@ const BOT_WEBHOOK_URL      = process.env.BOT_WEBHOOK_URL;
 const BOT_WEBHOOK_SECRET   = process.env.BOT_WEBHOOK_SECRET;
 
 const GROQ_URL   = "https://api.groq.com/openai/v1/chat/completions";
-const GROQ_MODEL = "openai/gpt-oss-120b";
+const GROQ_MODEL = "llama-3.3-70b-versatile";
 
 // ─── Repo Config ──────────────────────────────────────────────────
 const REPOS = [
@@ -237,16 +237,30 @@ async function executeTool(name, args, phone) {
         const branches = branchesRes.status === "fulfilled" ? branchesRes.value : [];
         const runs     = runsRes.status     === "fulfilled" ? runsRes.value.workflow_runs : [];
         const repoInfo = repoRes.status     === "fulfilled" ? repoRes.value     : {};
-        const report   = lastReports[phone];
+
+        // Always include full test details from lastReports
+        const report = lastReports[phone];
+        const s      = report?.summary;
+        const testDetails = s ? {
+          passed:       s.passed,
+          failed:       s.failed,
+          skipped:      s.skipped,
+          total:        s.total,
+          duration:     s.duration,
+          passedTests:  s.passedTests?.map(t => t.title)  || [],
+          failedTests:  s.failedTests?.map(t => ({ title: t.title, error: t.error })) || [],
+          skippedTests: s.skippedTests?.map(t => t.title) || [],
+          runUrl:       report.runUrl,
+        } : null;
 
         return JSON.stringify({
-          repo:     `${repoInfo.full_name} | ⭐${repoInfo.stargazers_count} | ${repoInfo.language}`,
-          issues:   issues.map(i => `#${i.number} [${i.labels?.map(l=>l.name).join(',')||'none'}] "${i.title}" @${i.user?.login}`),
-          prs:      prs.map(p => `#${p.number} "${p.title}" ${p.head?.ref}→${p.base?.ref}`),
-          commits:  commits.slice(0,5).map(c => `${c.sha?.slice(0,7)} ${c.commit?.author?.name}: ${c.commit?.message?.split('\n')[0]}`),
-          branches: branches.map(b => b.name),
-          runs:     runs.map(w => `${w.conclusion==='success'?'✅':'❌'} "${w.name}" ${w.status}/${w.conclusion||'running'}`),
-          testResults: report?.summary ? `✅${report.summary.passed} ❌${report.summary.failed} ⊝${report.summary.skipped}` : 'No results loaded',
+          repo:        `${repoInfo.full_name} | ⭐${repoInfo.stargazers_count} | ${repoInfo.language} | Branch: ${repoInfo.default_branch}`,
+          openIssues:  issues.map(i => `#${i.number} [${i.labels?.map(l=>l.name).join(',')||'none'}] "${i.title}" @${i.user?.login}`),
+          openPRs:     prs.map(p => `#${p.number} "${p.title}" ${p.head?.ref}→${p.base?.ref}`),
+          recentCommits: commits.slice(0,5).map(c => `${c.sha?.slice(0,7)} ${c.commit?.author?.name}: ${c.commit?.message?.split('\n')[0]}`),
+          branches:    branches.map(b => b.name),
+          workflowRuns: runs.map(w => `${w.conclusion==='success'?'✅':'❌'} "${w.name}" ${w.status}/${w.conclusion||'running'}`),
+          testResults: testDetails || 'No test results loaded yet — run tests first',
         });
       } catch (err) {
         return `Failed to get repo context: ${err.message}`;
@@ -452,17 +466,46 @@ async function runAgent(phone, userMessage) {
     {
       role: "system",
       content:
-        `You are a precise QA bot on WhatsApp for GitHub repos.\n` +
-        `Available repos: ${REPOS.map(r => `${r.id}. ${r.name} (${r.repo})`).join(', ')}\n\n` +
-        `STRICT RULES:\n` +
-        `- Do ONLY what the user explicitly asks. Nothing more.\n` +
-        `- "run tests" → ONLY run tests. Do NOT create issues or fix anything.\n` +
-        `- "create issues" → ONLY create issues. Do NOT fix them.\n` +
-        `- "fix #N" → ONLY fix that issue. Do NOT run tests first.\n` +
-        `- ONLY chain multiple tools if user explicitly asks for all steps in one message.\n` +
-        `- Reply in max 2 lines. Be direct and factual.\n` +
-        `- No bullet lists unless showing multiple items.\n` +
-        `- Always use repo_id 1 unless user specifies another.`,
+`You are an expert CI/CD and DevOps engineer with full access to GitHub repositories via tools.
+
+EXPERTISE:
+- Playwright test automation, GitHub Actions, CI/CD pipelines
+- Code quality, branch management, PR reviews, issue tracking
+- Any repo question: commits, branches, contributors, workflows, deployments
+- Test results analysis, failure diagnosis, fix recommendations
+
+AVAILABLE REPOS: ${REPOS.map(r => `${r.id}. ${r.name} (${r.repo})`).join(', ')}
+
+BEHAVIOUR:
+- Always call get_repo_context before answering any question about the repo — data must be live, never guessed
+- Do ONLY what user explicitly asks. NEVER take extra actions
+- Answers: max 2 lines, factual, direct. Use real numbers and names from tool data
+- For lists (test names, issues, PRs): show them clearly, one per line
+- For charts: use text format e.g. ✅ 21 ██████████ 91% | ❌ 0 | ⊝ 1
+- Test names ARE in testResults.passedTests/failedTests/skippedTests — always use them
+- Never say "data unavailable" if tool returned it
+- repo_id defaults to 1 unless user specifies
+
+CLARIFICATION RULES (important):
+- If the request is ambiguous or missing required info, ask ONE short clarifying question — do NOT call any tool yet
+- Examples of when to ask:
+  * "fix the issue" (no number) → ask "Which issue number? e.g. fix #160"
+  * "delete branch" (no name) → ask "Which branch name?"
+  * "run tests on branch" (no branch) → ask "Which branch?"
+  * "create a PR" (no context) → ask "PR for which branch/fix?"
+- If request is clear → act immediately, no need to ask
+- Never ask more than one question at a time
+
+TOOL USAGE (only when user clearly asks):
+- get_repo_context → any question about repo state, issues, PRs, commits, branches, test results
+- run_tests → only when user says run/trigger/execute tests
+- create_issues → only when user says create/log/raise issues
+- fix_issue → only when user says fix issue #N (needs a number)
+- execute_pr → only when user says execute/run/verify PR #N (needs a number)
+- merge_pr → only when user says merge PR #N (needs a number)
+- delete_branch → only when user says delete branch (needs a name)
+- cleanup_branches → only when user says cleanup/delete all ai-fix branches
+- close_issue → only when user says close issue #N (needs a number)`,
     },
     ...history,
     { role: "user", content: userMessage },
