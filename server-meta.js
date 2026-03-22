@@ -289,26 +289,47 @@ Respond ONLY with valid JSON (no markdown fences, no extra text):
 If you cannot determine a safe fix from the available data, return:
 { "fixes": [], "explanation": "<reason>", "prTitle": "", "rootCause": "" }`;
 
-    // Call Gemini — include screenshot as image if available
-    let geminiPayload;
+    // ── Gemini Structured Output ──────────────────────────────────
+    // Using responseSchema forces Gemini to ALWAYS return valid JSON
+    // No more parsing errors, no truncation issues
+    const geminiSchema = {
+      type: "object",
+      properties: {
+        prTitle:     { type: "string" },
+        explanation: { type: "string" },
+        rootCause:   { type: "string" },
+        fixes: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              path:    { type: "string" },
+              message: { type: "string" },
+              content: { type: "string" },
+            },
+            required: ["path", "message", "content"],
+          },
+        },
+      },
+      required: ["prTitle", "explanation", "rootCause", "fixes"],
+    };
+
+    const parts = [{ text: prompt }];
     if (hasScreenshot) {
-      geminiPayload = {
-        contents: [{
-          parts: [
-            { text: prompt },
-            { inline_data: { mime_type: "image/png", data: artifacts.screenshotBase64 } }
-          ]
-        }],
-        generationConfig: { maxOutputTokens: 8192, temperature: 0.1 },
-      };
-    } else {
-      geminiPayload = {
-        contents: [{ parts: [{ text: prompt }] }],
-        generationConfig: { maxOutputTokens: 8192, temperature: 0.1 },
-      };
+      parts.push({ inline_data: { mime_type: "image/png", data: artifacts.screenshotBase64 } });
     }
 
-    // Gemini call with retry on 429
+    const geminiPayload = {
+      contents: [{ parts }],
+      generationConfig: {
+        responseMimeType: "application/json",  // ← forces JSON output
+        responseSchema:   geminiSchema,         // ← enforces exact shape
+        temperature:      0.1,
+        maxOutputTokens:  8192,
+      },
+    };
+
+    // Call Gemini with retry on 429
     let geminiRes;
     for (let attempt = 0; attempt < 4; attempt++) {
       try {
@@ -316,49 +337,23 @@ If you cannot determine a safe fix from the available data, return:
         geminiRes = await axios.post(GEMINI_URL, geminiPayload);
         break;
       } catch (err) {
-        console.error(`❌ Gemini error (attempt ${attempt + 1}): ${err.response?.status} ${err.response?.data?.error?.message || err.message}`);
+        console.error(`❌ Gemini error: ${err.response?.status} ${err.response?.data?.error?.message || err.message}`);
         if (err.response?.status === 429 && attempt < 3) {
           const wait = (attempt + 1) * 15000;
-          console.log(`⏳ Gemini 429 — retrying in ${wait/1000}s (attempt ${attempt + 1})`);
+          console.log(`⏳ Rate limited — retrying in ${wait/1000}s`);
           await new Promise(r => setTimeout(r, wait));
         } else { throw err; }
       }
     }
-    let raw = geminiRes.data.candidates[0].content.parts[0].text.trim();
-    raw = raw.replace(/^```json\s*/i, "").replace(/^```\s*/i, "").replace(/```$/i, "").trim();
 
-    // Handle truncated JSON — try to recover
-    let geminiResult;
-    try {
-      geminiResult = JSON.parse(raw);
-    } catch (parseErr) {
-      console.error(`❌ JSON parse error: ${parseErr.message}`);
-      console.log(`Raw response (first 500): ${raw.slice(0, 500)}`);
-
-      // Try to extract partial JSON — at minimum get prTitle and explanation
-      const titleMatch = raw.match(/"prTitle"\s*:\s*"([^"]+)"/);
-      const explMatch  = raw.match(/"explanation"\s*:\s*"([^"]+)"/);
-      const causeMatch = raw.match(/"rootCause"\s*:\s*"([^"]+)"/);
-
-      if (titleMatch) {
-        // Gemini had content but JSON was cut off — ask it to just give fixes more concisely
-        console.log(`⚠️ Truncated JSON detected — retrying with concise mode`);
-        const concisePrompt = `${prompt}\n\nIMPORTANT: Your previous response was truncated. Keep file content SHORT — only include the changed lines with minimal context. Max 50 lines per file.`;
-        const retryRes = await axios.post(GEMINI_URL, {
-          contents: [{ parts: [{ text: concisePrompt }] }],
-          generationConfig: { maxOutputTokens: 4096, temperature: 0.1 },
-        });
-        let retryRaw = retryRes.data.candidates[0].content.parts[0].text.trim();
-        retryRaw = retryRaw.replace(/^```json\s*/i, "").replace(/^```\s*/i, "").replace(/```$/i, "").trim();
-        geminiResult = JSON.parse(retryRaw);
-      } else {
-        throw new Error(`Gemini returned invalid JSON: ${parseErr.message}`);
-      }
-    }
-    } // end else (Gemini path)
+    // With responseSchema, this is ALWAYS valid JSON — no parsing dance needed
+    const raw         = geminiRes.data.candidates[0].content.parts[0].text.trim();
+    const geminiResult = JSON.parse(raw);
 
     console.log(`🧠 Gemini fix: "${geminiResult.prTitle}" | ${geminiResult.fixes?.length || 0} file(s)`);
-    console.log(`🧠 Gemini file paths: ${geminiResult.fixes?.map(f => f.path).join(', ')}`);
+    console.log(`🧠 Files: ${geminiResult.fixes?.map(f => f.path).join(', ')}`);
+
+    } // end else (Gemini path)
 
     if (!geminiResult?.fixes?.length) {
       await send(phone, `⚠️ Could not auto-fix issue #${issueNumber}.\nReason: ${geminiResult?.explanation || "Unknown"}\n🔗 ${runUrl}`);
