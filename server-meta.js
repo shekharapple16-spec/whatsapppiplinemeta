@@ -355,6 +355,7 @@ If you cannot determine a safe fix from the available data, return:
         throw new Error(`Gemini returned invalid JSON: ${parseErr.message}`);
       }
     }
+    } // end else (Gemini path)
 
     console.log(`🧠 Gemini fix: "${geminiResult.prTitle}" | ${geminiResult.fixes?.length || 0} file(s)`);
     console.log(`🧠 Gemini file paths: ${geminiResult.fixes?.map(f => f.path).join(', ')}`);
@@ -1200,4 +1201,3 @@ async function send(toPhone, message) {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
-}
