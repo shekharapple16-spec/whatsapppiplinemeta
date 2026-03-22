@@ -700,8 +700,10 @@ app.post("/webhook", async (req, res) => {
       console.log(`📱 [${fromPhone}]: ${messageBody}`);
       res.sendStatus(200);
 
-      // ── Instant Groq acknowledgment — 1 line, no tools ────────────
-      getGroqAck(messageBody.trim()).then(ack => { if (ack) send(fromPhone, ack); });
+      // ── Smart ack: only for tool-related requests ────────────
+      const actionKeywords = ["run tests", "fix", "create issue", "merge", "delete branch", "execute pr", "cleanup"];
+      const needsAck = actionKeywords.some(kw => messageBody.toLowerCase().includes(kw));
+      if (needsAck) send(fromPhone, `⚙️ Processing...`);
 
       runAgent(fromPhone, messageBody.trim())
         .then(reply => send(fromPhone, reply))
