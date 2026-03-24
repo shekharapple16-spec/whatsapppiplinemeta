@@ -935,15 +935,20 @@ async function loadReport(phone, repo, runId, run) {
       return;
     }
     
-    const jsonArt = artifacts.find(a => a.name.includes("json-report") || a.name.includes("playwright") || a.name.includes("test-report"));
-    if (!jsonArt) {
-      console.log(`⚠️ No test report artifact found. Available: ${artifacts.map(a=>a.name).join(', ')}`);
+    // Look for JSON report OR Playwright HTML report
+    const jsonArt = artifacts.find(a => a.name.includes("json-report") || a.name.includes("test-report") || a.name.includes("results"));
+    const htmlArt = artifacts.find(a => a.name === "playwright-report" || a.name.includes("playwright"));
+    
+    const reportArt = jsonArt || htmlArt;
+    if (!reportArt) {
+      console.log(`⚠️ No test report found. Available artifacts: ${artifacts.map(a=>a.name).join(', ')}`);
+      console.log(`💡 Tip: Configure JSON reporter in playwright.config.ts to get test details`);
       lastReports[phone] = { repo: repo.repo, repoName: repo.name, runUrl: run?.html_url, conclusion: run?.conclusion, summary: null, fetchedAt: Date.now() };
       return;
     }
     
-    console.log(`📦 Downloading artifact: ${jsonArt.name} (${Math.round(jsonArt.size_in_bytes / 1024)}KB)`);
-    const dlRes = await axios.get(jsonArt.archive_download_url, { 
+    console.log(`📦 Downloading artifact: ${reportArt.name} (${Math.round(reportArt.size_in_bytes / 1024)}KB)`);
+    const dlRes = await axios.get(reportArt.archive_download_url, { 
       headers: { Authorization: `token ${GITHUB_TOKEN}` }, 
       responseType: "arraybuffer", 
       maxRedirects: 5,
@@ -958,19 +963,40 @@ async function loadReport(phone, repo, runId, run) {
     const { default: JSZip } = await import("jszip");
     const zip = await JSZip.loadAsync(dlRes.data);
     
-    // Find JSON report file
-    let reportFile = zip.file("playwright-results.json") || zip.file("test-results/results.json") || zip.file("results.json");
+    // Try to find JSON report first (multiple possible names)
+    let reportFile = zip.file("test-results.json") || 
+                     zip.file("index.json") || 
+                     zip.file("playwright-results.json") || 
+                     zip.file("test-results/results.json") || 
+                     zip.file("results.json");
     
-    // If not found, search for any JSON file
+    // Search for JSON in root and shallow dirs
     if (!reportFile) {
-      const files = Object.keys(zip.files);
-      const jsonFiles = files.filter(f => f.endsWith(".json"));
-      reportFile = jsonFiles.length > 0 ? zip.file(jsonFiles[0]) : null;
-      if (reportFile) console.log(`ℹ️ Using JSON file: ${jsonFiles[0]}`);
+      const allFiles = Object.keys(zip.files);
+      const jsonFiles = allFiles.filter(f => 
+        f.endsWith(".json") && 
+        !f.includes("node_modules") && 
+        !f.includes("trace/") &&
+        (f.split('/').length <= 2 || f.includes("test") || f.includes("result"))
+      );
+      if (jsonFiles.length > 0) {
+        console.log(`ℹ️ Found JSON report: ${jsonFiles[0]}`);
+        reportFile = zip.file(jsonFiles[0]);
+      }
     }
     
     if (!reportFile) {
-      console.log(`⚠️ No JSON report found in artifact. Files: ${Object.keys(zip.files).slice(0,10).join(', ')}`);
+      console.log(`⚠️ No JSON report in artifact. Files: ${Object.keys(zip.files).filter(f=>!f.includes('/')).slice(0,10).join(', ')}`);
+      console.log(`💡 Add to playwright.config.ts: reporter: [['json', { outputFile: 'results.json' }]`);
+      // Return empty summary - run completed but no detailed results
+      lastReports[phone] = { 
+        repo: repo.repo, 
+        repoName: repo.name || repo.repo.split('/')[1], 
+        runUrl: run?.html_url || `https://github.com/${repo.repo}/actions/runs/${runId}`, 
+        conclusion: run?.conclusion || "completed",
+        summary: { passed: 0, failed: 0, skipped: 0, total: 0, duration: 0, passedTests: [], failedTests: [], skippedTests: [] }, 
+        fetchedAt: Date.now() 
+      };
       return;
     }
     
