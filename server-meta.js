@@ -19,7 +19,7 @@ const GROQ_API_KEY         = process.env.GROQ_API_KEY;
 const BOT_WEBHOOK_SECRET   = process.env.BOT_WEBHOOK_SECRET;
 
 const GROQ_URL        = "https://api.groq.com/openai/v1/chat/completions";
-const GROQ_MODEL      = "openai/gpt-oss-120b";
+const GROQ_MODEL      = "qwen/qwen3-32b";
 const GROQ_FAST_MODEL = "llama-3.1-8b-instant";
 
 // ─── Repo Config ──────────────────────────────────────────────────
@@ -50,7 +50,7 @@ const REPOS = [
 const chatHistory  = {}; // { phone: [{role, content}] }
 const lastReports  = {}; // { phone: reportData }
 const pendingFixes = {}; // { phone_issue: context }
-const MAX_HISTORY  = 10;
+const MAX_HISTORY  = 6;  // 3 exchanges — keeps prompt small for 8000 TPM
 
 // ════════════════════════════════════════════════════════════════════
 //  GITHUB MCP CLIENT — singleton, initialized once at startup
@@ -105,9 +105,25 @@ async function callMCP(toolName, args) {
     throw new Error(`MCP not connected — tool ${toolName} unavailable`);
   }
   const result = await mcpClient.callTool({ name: toolName, arguments: args });
-  // MCP returns content array — extract text
-  const text = result.content?.map(c => c.text || JSON.stringify(c)).join("\n") || "";
-  return text;
+  const text   = result.content?.map(c => c.text || JSON.stringify(c)).join("\n") || "";
+
+  // Trim large responses to save tokens — Groq free tier is 8000 TPM
+  const LIMITS = {
+    get_file_contents:    3000,  // file content
+    search_code:          2000,  // search results
+    list_issues:          1500,  // issue list
+    list_pull_requests:   1500,
+    list_commits:         1000,
+    get_pull_request:     1500,
+    get_issue:            1500,
+    list_branches:        500,
+    default:              2000,
+  };
+  const limit = LIMITS[toolName] || LIMITS.default;
+  const trimmed = text.length > limit ? text.slice(0, limit) + "\n...[truncated]" : text;
+
+  console.log(`📦 MCP ${toolName}: ${text.length} chars → ${trimmed.length} chars`);
+  return trimmed;
 }
 
 // ════════════════════════════════════════════════════════════════════
@@ -423,7 +439,7 @@ TOOL SELECTION:
         tools:       allTools,
         tool_choice: "auto",
         temperature: 0.1,
-        max_tokens:  1024,
+        max_tokens:  512,  // keep output small — saves TPM for tool results
       }, {
         headers: { Authorization: `Bearer ${GROQ_API_KEY}`, "Content-Type": "application/json" },
       });
