@@ -215,7 +215,8 @@ async function executeTool(name, args, phone) {
             const s = r?.summary;
             if (!s) return `Run completed. Check: ${run.html_url}`;
             const failedList = s.failedTests?.length ? `Failed: ${s.failedTests.map(t=>t.title).join(', ')}` : 'All passing!';
-            return `Tests: ✅${s.passed}p ❌${s.failed}f ⊝${s.skipped}s ⏱${s.duration}s\n${failedList}\n${run.html_url}`;
+            const suggestion = s.failed > 0 ? `\n💡 Say "create issue" to log failures` : '';
+            return `Tests: ✅${s.passed}p ❌${s.failed}f ⊝${s.skipped}s ⏱${s.duration}s\n${failedList}${suggestion}\n${run.html_url}`;
           }
           console.log(`⏳ [${Math.round(attempt*30/60)}m] ${run.status}`);
           attempt++;
@@ -536,16 +537,28 @@ TOOL PARAMETER RULES - CRITICAL:
 - **Branch names are STRINGS**: delete_branch "ai-fix-123" or "feature/xyz"
 - **repo_id is always 1 for HCL Playwright** unless user says "repo 2" or similar
 
-TOOL DECISIONS (only call when user clearly asks):
-- get_repo_context → "show/tell me about repo" or any question about issues/PRs/tests/commits/branches
-- run_tests → "run tests" or "trigger tests" or "execute tests"
-- create_issues → "create issue(s)" or "log issue(s)". Always check testResults.failedTests first
-- fix_issue → "fix issue #N" (must have issue number). Searches issue body for test details
-- execute_pr → "execute PR #N" or "run tests on PR #N" (must have PR number)
-- merge_pr → "merge PR #N" (must have PR number). Returns success/failure with details
-- delete_branch → "delete branch X" (must have branch name)
-- cleanup_branches → "cleanup ai-fix branches" or "delete all fix branches"
-- close_issue → "close issue #N" (must have issue number)
+TYPO TOLERANCE - IMPORTANT:
+- "craete issue" = create issue (handle typos, don't ask for clarification)
+- "create isue" = create issue
+- "create issu" = create issue
+- "log issue" = create issue
+- "raise issue" = create issue
+- "file issue" = create issue
+- Always recognize INTENT not perfect spelling
+
+TOOL DECISIONS (BE AGGRESSIVE - call when user clearly INTENDS the action):
+- get_repo_context → "show/tell me about repo", "what issues", "failed tests", any context question
+- run_tests → "run tests", "trigger tests", "execute tests", "test please"
+- create_issues → "create issue(s)", "craete issue", "log issue", "raise issue", "file issue", "create for failed"
+  * **ALWAYS call when user has just run tests and says "create issue"**
+  * **ALWAYS use repo_id: 1 (default)**
+  * **ALWAYS create from testResults.failedTests in lastReports[phone]**
+- fix_issue → "fix issue #N", "fix #N", "fix the issue" (with # number). Searches issue body for test details
+- execute_pr → "execute PR #N", "run tests on PR #N", "verify PR #N"
+- merge_pr → "merge PR #N", "merge #N". Returns success/failure with details
+- delete_branch → "delete branch X", "remove branch X"
+- cleanup_branches → "cleanup ai-fix branches", "delete all fix branches", "cleanup branches"
+- close_issue → "close issue #N", "close #N" (with # number)
 
 RESPONSE EXAMPLES:
 User: "run tests"
