@@ -637,42 +637,57 @@ app.post("/ai-fix-callback", async (req, res) => {
 });
 
 // ─── Groq fix generation ──────────────────────────────────────────
+
+function extractTestFunction(testContent, testTitle) {
+  if (!testContent || !testTitle) return testContent;
+  const safeName = testTitle.replace(/[^\w]/g, '\\s*');
+  const regex = new RegExp(`(?:test|it)\\s*\\(['"]${safeName}['"]\\s*,\\s*async\\s*\\([^)]*\\)\\s*=>\\s*\\{[\\s\\S]*?\\n\\s*\\}`, 'i');
+  const match = testContent.match(regex);
+  return match ? match[0] : testContent;
+}
+
+function minifyCode(code) {
+  if (!code) return '';
+  return code.replace(/\/\/.*$/gm, '').replace(/\/\*[\s\S]*?\*\//g, '').replace(/\s+/g, ' ').trim();
+}
+
 async function generateFix(testTitle, testFile, testResult, artifacts, sourceFiles, runUrl) {
   const error        = testResult?.error || testResult?.failedTests?.[0]?.error || "No error";
-  const testContent  = sourceFiles?.[testFile] || sourceFiles?.[Object.keys(sourceFiles||{}).find(p=>p.includes(path.basename(testFile||'')))] || "";
+  let testContent    = sourceFiles?.[testFile] || sourceFiles?.[Object.keys(sourceFiles||{}).find(p=>p.includes(path.basename(testFile||'')))] || "";
   const domSnapshot  = artifacts?.domSnapshot || "";
 
-  // Extract only relevant DOM
-  const selectors = [...(testContent.matchAll(/(?:locator|fill|click|waitFor\w*)\s*\(\s*['"`]([^'"`\n]{2,60})['"`]/g))].map(m=>m[1]).slice(0,10);
-  const relevantDom = selectors.length > 0
-    ? (domSnapshot.match(/<[^>]+>[^<]*/g)||[]).filter(t=>selectors.some(s=>t.includes(s.replace(/^[#.]/,'')))).slice(0,15).join('\n').slice(0,1500)
-    : domSnapshot.slice(0,1000);
+  testContent = extractTestFunction(testContent, testTitle);
+  const minifiedTest = minifyCode(testContent).slice(0, 1200);
 
-  const pageObj = Object.entries(sourceFiles||{}).find(([p])=>p.includes('pages/')||p.toLowerCase().includes('page'));
+  const selectors = [...(minifiedTest.matchAll(/(?:locator|fill|click|type|waitFor\w*|getBy\w+)\s*\(['"`]([^'"`\n]{2,60})['"`]/g))].map(m=>m[1]).slice(0,8);
+  const relevantDom = selectors.length > 0
+    ? (domSnapshot.match(/<[^>]+>[^<]*/g)||[]).filter(t=>selectors.some(s=>t.includes(s.replace(/^[#.\[]/,'')))).slice(0,12).join('\n').slice(0,1200)
+    : domSnapshot.slice(0,800);
+
+  const pageObj = Object.entries(sourceFiles||{}).find(([p])=>p.includes('pages/')||p.includes('fixtures')||p.toLowerCase().includes('page'));
+  const pageObjCode = pageObj ? minifyCode(pageObj[1]).slice(0,800) : '';
 
   const prompt =
-    `Fix this Playwright test. Minimal change only.\n\n` +
-    `ERROR: ${error.slice(0,400)}\n\n` +
-    `TEST (${testFile}):\n\`\`\`js\n${testContent.slice(0,2500)}\n\`\`\`\n\n` +
-    `${pageObj ? `PAGE OBJECT (${pageObj[0]}):\n\`\`\`js\n${pageObj[1].slice(0,1500)}\n\`\`\`` : ''}\n\n` +
-    `${relevantDom ? `RELEVANT DOM:\n\`\`\`html\n${relevantDom}\n\`\`\`` : ''}\n\n` +
-    `VALID PATHS: ${Object.keys(sourceFiles||{}).map(p=>`\`${p}\``).join(', ') || `\`${testFile}\``}\n\n` +
-    `Return JSON: {"prTitle":"fix:...","explanation":"...","rootCause":"...","fixes":[{"path":"...","message":"...","content":"<full file>"}]}`;
+    `Fix test "${testTitle}"\n\nERROR: ${error.slice(0,300)}\n\nTEST:\n\`\`\`js\n${minifiedTest}\n\`\`\`` +
+    `${pageObjCode ? `\n\nPAGE:\n\`\`\`js\n${pageObjCode}\n\`\`\`` : ''}` +
+    `${relevantDom ? `\n\nDOM:\n\`\`\`html\n${relevantDom}\n\`\`\`` : ''}\n\n` +
+    `Return JSON: {"prTitle":"fix:...","explanation":"...","rootCause":"...","fixes":[{"path":"${testFile}","message":"...","content":"..."}]}`;
 
   try {
     const res = await axios.post(GROQ_URL, {
       model:           GROQ_MODEL,
       messages:        [
-        { role: "system", content: "Expert Playwright engineer. Return ONLY valid JSON. No markdown." },
+        { role: "system", content: "Expert Playwright engineer. Return ONLY JSON." },
         { role: "user",   content: prompt }
       ],
       response_format: { type: "json_object" },
-      temperature:     0.1,
-      max_tokens:      4096,
+      temperature:     0.05,
+      max_tokens:      1500,
     }, { headers: { Authorization: `Bearer ${GROQ_API_KEY}`, "Content-Type": "application/json" } });
 
     const result = JSON.parse(res.data.choices[0].message.content);
-    console.log(`🧠 Fix: "${result.prTitle}" | ${result.fixes?.length} file(s) | paths: ${result.fixes?.map(f=>f.path).join(',')}`);
+    const tokens = res.data.usage?.total_tokens || 0;
+    console.log(`🧠 Fix: "${result.prTitle}" | 🔑 ${tokens} tokens`);
     return result;
   } catch (err) {
     console.error("❌ generateFix:", err.message);
