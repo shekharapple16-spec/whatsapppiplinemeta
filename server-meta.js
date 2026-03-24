@@ -1,6 +1,8 @@
 import dotenv from "dotenv";
 import express from "express";
 import axios from "axios";
+import fs from "fs";
+import path from "path";
 
 dotenv.config();
 
@@ -18,7 +20,7 @@ const BOT_WEBHOOK_URL      = process.env.BOT_WEBHOOK_URL;
 const BOT_WEBHOOK_SECRET   = process.env.BOT_WEBHOOK_SECRET;
 
 const GROQ_URL   = "https://api.groq.com/openai/v1/chat/completions";
-const GROQ_MODEL = "openai/gpt-oss-120b";
+const GROQ_MODEL = "llama-3.3-70b-versatile";
 
 // ─── Repo Config ──────────────────────────────────────────────────
 const REPOS = [
@@ -55,6 +57,19 @@ const TOOL_DEFINITIONS = [
     function: {
       name: "get_test_details",
       description: "Get detailed test results (passed/failed/skipped) from last test run - INSTANT LOCAL",
+      parameters: {
+        type: "object",
+        properties: {
+          repo_id: { type: "number", description: "Repo ID. Default 1." }
+        },
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "show_failed_tests",
+      description: "Show only FAILED tests from last run with error details - INSTANT LOCAL MEMORY",
       parameters: {
         type: "object",
         properties: {
@@ -367,6 +382,23 @@ async function executeTool(name, args, phone) {
       }
     }
 
+    case "show_failed_tests": {
+      try {
+        const report = lastReports[phone];
+        if (!report?.summary?.failedTests?.length) return "No failed tests. All tests passed!";
+        const failed = report.summary.failedTests;
+        let output = `❌ Failed: ${failed.length} test(s)\n`;
+        for (const test of failed) {
+          output += `\n• ${test.title}`;
+          if (test.file) output += `\n  File: ${test.file}`;
+          if (test.error) output += `\n  Error: ${test.error.substring(0, 150)}...`;
+        }
+        return output;
+      } catch (err) {
+        return `Failed: ${err.message}`;
+      }
+    }
+
     case "list_workflows": {
       try {
         const workflows = await ghGet(`/repos/${repo.repo}/contents/.github/workflows`);
@@ -380,10 +412,6 @@ async function executeTool(name, args, phone) {
 
     case "find_files": {
       try {
-        const fs = require('fs');
-        const path = require('path');
-        const repoPath = repo.repo.includes('/') ? process.cwd() : process.cwd();
-        
         const files = [];
         function walkDir(dir, pattern) {
           if (files.length > 50) return;
@@ -391,7 +419,7 @@ async function executeTool(name, args, phone) {
           for (const item of items) {
             if (files.length > 50) break;
             const fullPath = path.join(dir, item.name);
-            if (item.isDirectory() && !item.name.startsWith('.')) {
+            if (item.isDirectory() && !item.name.startsWith('.') && !item.name.includes('node_modules')) {
               walkDir(fullPath, pattern);
             } else if (item.isFile()) {
               const regex = new RegExp(pattern.replace(/\*/g, '.*').replace(/\./g, '\\.'));
@@ -408,10 +436,7 @@ async function executeTool(name, args, phone) {
 
     case "search_files": {
       try {
-        const fs = require('fs');
-        const path = require('path');
         const results = [];
-        
         function walkDir(dir, pattern, query) {
           if (results.length > 30) return;
           const items = fs.readdirSync(dir, { withFileTypes: true });
@@ -460,10 +485,8 @@ async function executeTool(name, args, phone) {
             const r = lastReports[phone];
             const s = r?.summary;
             if (!s) return `Run completed but no report found. URL: ${run.html_url}`;
-            const result = `✅${s.passed}P ❌${s.failed}F ⊝${s.skipped}S ${run.html_url}`;
-            if (s.failed > 0) {
-              return `${result}\\n\\nWhat next? \"create issues\", \"fix issues\", or \"done\"?`;
-            }
+            const status = s.failed > 0 ? "❌ FAILED" : "✅ PASSED";
+            const result = `${status}: ${s.passed}P ❌${s.failed}F ⊝${s.skipped}S\n${run.html_url}`;
             return result;
           }
           console.log(`⏳ [${Math.round(attempt*30/60)}m] ${run.status}`);
@@ -568,9 +591,34 @@ async function executeTool(name, args, phone) {
 
     case "fix_issue": {
       try {
+        // Check if user meant "fix all failed tests from last run"
+        const report = lastReports[phone];
+        if (report?.summary?.failedTests?.length && !args.issue_number) {
+          // User said "fix issues" - intelligently handle failed tests
+          const failed = report.summary.failedTests;
+          
+          // Check if GitHub issues already exist
+          const existing = await ghGet(`/repos/${repo.repo}/issues?state=open&per_page=100`);
+          const needsCreation = failed.filter(t => 
+            !existing.find(i => i.title.toLowerCase().includes(t.title.toLowerCase()))
+          );
+          
+          if (needsCreation.length > 0) {
+            // Auto-create issues for new failures, then offer to fix
+            return `Found ${failed.length} failed test(s). ${needsCreation.length} need GitHub issues.\n\nI'll: 1) Create issues 2) Fix them\n\nConfirm: "yes fix all" or just "create issues"?`;
+          } else {
+            // Issues exist, ready to fix
+            return `Found ${failed.length} failed test(s) with existing issues.\n\nReady to fix? Confirm: "yes fix all" or specify issue #`;
+          }
+        }
+        
+        if (!args.issue_number) {
+          return "Which issue number? e.g. 'fix issue #42'";
+        }
+        
         const issue = await ghGet(`/repos/${repo.repo}/issues/${args.issue_number}`);
         const testTitle = issue.title.replace("🐛 [Playwright] ", "").trim();
-        return `Ready to fix issue #${args.issue_number}: "${testTitle}"?\\nConfirm: "yes fix #${args.issue_number}" or "cancel"`;
+        return `Ready to fix issue #${args.issue_number}: "${testTitle}"?\nConfirm: "yes fix #${args.issue_number}" or "cancel"`;
       } catch (err) {
         return `Failed: ${err.message}`;
       }
@@ -763,22 +811,39 @@ async function runAgent(phone, userMessage) {
     {
       role: "system",
       content:
-`Expert CI/CD. Repos: ${REPOS.map(r => `${r.id}:${r.name}`).join(', ')}
-FAST LOCAL TOOLS (use first): get_test_details, list_workflows, find_files, search_files - instant local queries
-GITHUB TOOLS (when needed): get_repo_context, run_tests, create_issues, fix_issue, execute_pr, merge_pr, delete_branch
+`Expert CI/CD Agent. Repos: ${REPOS.map(r => `${r.id}:${r.name}`).join(', ')}
 
-COMMAND vs CONCERN:
-- EXPLICIT COMMANDS (run, fix, delete, create, merge, close): Execute immediately, ask for confirmation if destructive
-- CONCERNS/OBSERVATIONS (hope, worried, seems, probably, expected): Acknowledge, suggest action, DON'T auto-execute
-- QUESTIONS (where, how, why, what, when): Answer with get_repo_context or search_files, provide details
+INTELLIGENCE > MECHANICS: Reason about what user needs, don't just execute commands mechanically.
 
-EXAMPLES:
-- "run tests" → execute run_tests
-- "hope there are no flaky tests" → "Tests look good (21p, 1s). To verify stability, I can run them again. Want me to?"
-- "where is the login handler" → search_files + return location
-- "fix the failing test" → get_repo_context, then ask "Confirm: fix failing test?" before executing
+UNDERSTANDING CONTEXT:
+- Read full conversation history to understand user's goal
+- Use lastReports[phone] to know current test state
+- If tests are cached, don't ask "run tests first" - use cached data
+- If failed tests exist, know what's broken without asking
 
-DIRECT: Answer what user asks. No menus. No "what next?" suggestions unless user asks. No clarifying unless truly ambiguous.
+DYNAMIC REASONING:
+- User: "fix issues" + failed tests in memory → automatically create issues + fix
+- User: "show failed tests" + just ran tests → show from memory instantly
+- User: "fix issue #42" + issue has test failure → analyze code, suggest fix, ask confirmation
+- User: "hope no flaky tests" + all pass → acknowledge, don't re-run
+- User: "where is X" → search codebase, give exact location + context
+
+TOOL SELECTION:
+- FAST LOCAL (instant): get_test_details, show_failed_tests, list_workflows, find_files, search_files
+- GITHUB API (when needed): run_tests, create_issues, get_repo_context, fix_issue, execute_pr, merge_pr
+- NO redundant calls: If you have test data in memory, don't call run_tests again
+
+SMART WORKFLOWS:
+1. Tests fail → "Create issues first? I'll auto-create + auto-fix" (don't ask 10x)
+2. User says "fix" → check what's broken, explain fix, ask confirmation once
+3. Multiple failed tests → handle all in sequence, not one-by-one asking
+
+CONVERSATION STYLE:
+- Understand intent, not literal words
+- Be proactive: "I notice X, should I Y?"
+- Be concise: Results + next logical step, no menus
+- Remember state: Don't lose track of test results or context
+
 NO LOOPS: Don't call same tool twice in one request.`,
     },
     ...history,
