@@ -10,26 +10,24 @@ dotenv.config();
 const app = express();
 app.use(express.json({ limit: "10mb" }));
 
-// ─── ENV ─────────────────────────────────────────────
+// ENV
 const {
   META_PHONE_ID,
   META_API_TOKEN,
   WEBHOOK_VERIFY_TOKEN,
   GITHUB_TOKEN,
   GROQ_API_KEY,
-  GITHUB_OWNER,   // add in .env
-  GITHUB_REPO     // add in .env
+  GITHUB_OWNER,
+  GITHUB_REPO
 } = process.env;
 
 const GROQ_URL = "https://api.groq.com/openai/v1/chat/completions";
-const FAST_MODEL = "llama-3.1-8b-instant";
+const MODEL = "llama-3.1-8b-instant";
 
-// ─── STATE ───────────────────────────────────────────
-const chatHistory = {};
 let mcpClient = null;
 let mcpConnected = false;
 
-// ─── MCP INIT ────────────────────────────────────────
+// ─── INIT MCP ─────────────────────────────
 async function initMCP() {
   try {
     mcpClient = new Client({ name: "bot", version: "1.0" });
@@ -52,8 +50,8 @@ async function initMCP() {
   }
 }
 
-// ─── MCP CALL ────────────────────────────────────────
-async function callMCP(name, args = {}) {
+// ─── EXECUTE TOOL (MISSING PIECE) ─────────
+async function executeTool(name, args = {}) {
   if (!mcpConnected) return "⚠️ MCP not connected";
 
   try {
@@ -67,98 +65,80 @@ async function callMCP(name, args = {}) {
     });
 
     let text = res.content?.map(c => c.text || "").join("\n") || "";
-    text = text.slice(0, 800);
+    return text.slice(0, 800) || "No result";
 
-    try {
-      const json = JSON.parse(text);
-
-      if (Array.isArray(json)) {
-        return json.slice(0, 5)
-          .map(i => `#${i.number} ${i.title}`)
-          .join("\n");
-      }
-
-      if (json.title) {
-        return `#${json.number} ${json.title} (${json.state})`;
-      }
-    } catch {}
-
-    return text || "No data";
   } catch (e) {
-    return `❌ MCP error: ${e.message}`;
+    return `❌ Tool error: ${e.message}`;
   }
 }
 
-// ─── DIRECT COMMANDS ─────────────────────────────────
-async function directCommand(msg) {
+// ─── DIRECT COMMANDS ──────────────────────
+async function routeCommand(msg) {
   const text = msg.toLowerCase().trim();
 
   if (text === "run tests") {
-    return "🚀 Tests triggered";
+    return "🚀 Hook your GitHub Action here";
   }
 
   if (text.startsWith("fix #")) {
     const id = text.replace("fix #", "");
-    return `🔧 Fix started for issue #${id}`;
+    return `🔧 Trigger fix workflow for #${id}`;
   }
 
   if (text === "issues") {
-    return callMCP("list_issues");
+    return executeTool("list_issues");
   }
 
   if (text.startsWith("issue #")) {
     const id = Number(text.replace("issue #", ""));
-    return callMCP("get_issue", { issue_number: id });
+    return executeTool("get_issue", { issue_number: id });
   }
 
   if (text === "prs") {
-    return callMCP("list_pull_requests");
+    return executeTool("list_pull_requests");
   }
 
   if (text.startsWith("pr #")) {
     const id = Number(text.replace("pr #", ""));
-    return callMCP("get_pull_request", { pullNumber: id });
+    return executeTool("get_pull_request", { pullNumber: id });
   }
 
   return null;
 }
 
-// ─── LLM FALLBACK ────────────────────────────────────
+// ─── LLM (ONLY IF NEEDED) ─────────────────
 async function runLLM(message) {
   try {
-    const res = await axios.post(
-      GROQ_URL,
-      {
-        model: FAST_MODEL,
-        messages: [
-          { role: "system", content: "DevOps assistant. Max 2 lines." },
-          { role: "user", content: message }
-        ],
-        max_tokens: 100
-      },
-      {
-        headers: {
-          Authorization: `Bearer ${GROQ_API_KEY}`,
-          "Content-Type": "application/json"
-        }
+    const res = await axios.post(GROQ_URL, {
+      model: MODEL,
+      messages: [
+        { role: "system", content: "DevOps assistant. Keep answer short." },
+        { role: "user", content: message }
+      ],
+      max_tokens: 100
+    }, {
+      headers: {
+        Authorization: `Bearer ${GROQ_API_KEY}`,
+        "Content-Type": "application/json"
       }
-    );
+    });
 
     return res.data.choices?.[0]?.message?.content || "No response";
+
   } catch (e) {
     return "⚠️ LLM error";
   }
 }
 
-// ─── MAIN AGENT ──────────────────────────────────────
-async function runAgent(phone, message) {
-  const direct = await directCommand(message);
+// ─── MAIN AGENT ───────────────────────────
+async function runAgent(message) {
+  const direct = await routeCommand(message);
   if (direct) return direct;
 
   return runLLM(message);
 }
 
-// ─── WHATSAPP SEND ───────────────────────────────────
+// ─── WHATSAPP SEND ────────────────────────
 async function send(to, msg) {
   try {
     await axios.post(
@@ -181,45 +161,39 @@ async function send(to, msg) {
   }
 }
 
-// ─── WEBHOOK ─────────────────────────────────────────
+// ─── WEBHOOK ──────────────────────────────
 app.get("/webhook", (req, res) => {
-  const token = req.query["hub.verify_token"];
-  const challenge = req.query["hub.challenge"];
-
-  if (token === WEBHOOK_VERIFY_TOKEN) {
-    return res.send(challenge);
+  if (req.query["hub.verify_token"] === WEBHOOK_VERIFY_TOKEN) {
+    return res.send(req.query["hub.challenge"]);
   }
-
-  return res.sendStatus(403);
+  res.sendStatus(403);
 });
 
 app.post("/webhook", async (req, res) => {
   try {
     const msg = req.body?.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
 
-    if (!msg || !msg?.text?.body) {
-      return res.sendStatus(200);
-    }
+    if (!msg?.text?.body) return res.sendStatus(200);
 
     const phone = msg.from;
     const text = msg.text.body;
 
     res.sendStatus(200);
 
-    const reply = await runAgent(phone, text);
+    const reply = await runAgent(text);
     await send(phone, reply);
 
   } catch (e) {
-    console.error("❌ Webhook error:", e.message);
+    console.error("❌ Webhook:", e.message);
     if (!res.headersSent) res.sendStatus(500);
   }
 });
 
-// ─── START ───────────────────────────────────────────
+// START
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, async () => {
-  console.log(`🚀 Server running on ${PORT}`);
+  console.log("🚀 Server running:", PORT);
   await initMCP();
 });
 
