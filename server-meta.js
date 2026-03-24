@@ -77,8 +77,9 @@ const TOOL_DEFINITIONS = [
       parameters: {
         type: "object",
         properties: {
-          repo_id: { type: "number", description: "Repo ID. Default 1." }
+          repo_id: { type: "integer", description: "Repo ID (1 for HCL Playwright). Default 1." }
         },
+        required: []
       }
     }
   },
@@ -178,8 +179,16 @@ const TOOL_DEFINITIONS = [
 // ════════════════════════════════════════════════════════════════════
 
 async function executeTool(name, args, phone) {
-  const repo = REPOS.find(r => r.id === (args.repo_id || 1)) || REPOS[0];
-  console.log(`🔧 Tool: ${name} | Args: ${JSON.stringify(args)}`);
+  // Parse and validate repo_id early
+  const repoId = parseInt(args.repo_id) || 1;
+  const repo = REPOS.find(r => r.id === repoId) || REPOS[0];
+  
+  // Parse numeric args safely
+  const issueNumber = args.issue_number ? parseInt(args.issue_number) : null;
+  const prNumber = args.pr_number ? parseInt(args.pr_number) : null;
+  const branchName = args.branch_name ? String(args.branch_name).trim() : null;
+  
+  console.log(`🔧 Tool: ${name} | Args: ${JSON.stringify({...args, repo_id: repoId, issue_number: issueNumber, pr_number: prNumber})}`);
 
   switch (name) {
 
@@ -193,23 +202,27 @@ async function executeTool(name, args, phone) {
         // Poll for completion
         await sleep(12000);
         const runsRes      = await ghGet(`/repos/${repo.repo}/actions/runs?per_page=1`);
-        const trackedRunId = runsRes.workflow_runs[0]?.id;
+        const trackedRunId = runsRes.workflow_runs?.[0]?.id;
+        if (!trackedRunId) return `❌ Failed to get workflow run ID`;
+        
         let attempt = 0;
-        while (true) {
+        while (attempt < 30) {
           await sleep(30000);
           const run = await ghGet(`/repos/${repo.repo}/actions/runs/${trackedRunId}`);
           if (run.status === "completed") {
             await loadReport(phone, repo, trackedRunId, run);
             const r = lastReports[phone];
             const s = r?.summary;
-            if (!s) return `Run completed but no report found. URL: ${run.html_url}`;
-            return `Tests done: ✅${s.passed} passed, ❌${s.failed} failed, ⊝${s.skipped} skipped, ⏱${s.duration}s. ${s.failedTests?.length ? `Failed: ${s.failedTests.map(t=>t.title).join(', ')}` : 'All passing!'}. Run: ${run.html_url}`;
+            if (!s) return `Run completed. Check: ${run.html_url}`;
+            const failedList = s.failedTests?.length ? `Failed: ${s.failedTests.map(t=>t.title).join(', ')}` : 'All passing!';
+            return `Tests: ✅${s.passed}p ❌${s.failed}f ⊝${s.skipped}s ⏱${s.duration}s\n${failedList}\n${run.html_url}`;
           }
           console.log(`⏳ [${Math.round(attempt*30/60)}m] ${run.status}`);
           attempt++;
         }
+        return `❌ Tests timeout (30min+)`;
       } catch (err) {
-        return `Failed to run tests: ${err.message}`;
+        return `❌ Failed to run tests: ${err.message}`;
       }
     }
 
@@ -228,7 +241,7 @@ async function executeTool(name, args, phone) {
         const prs      = prsRes.status      === "fulfilled" ? prsRes.value      : [];
         const commits  = commitsRes.status  === "fulfilled" ? commitsRes.value  : [];
         const branches = branchesRes.status === "fulfilled" ? branchesRes.value : [];
-        const runs     = runsRes.status     === "fulfilled" ? runsRes.value.workflow_runs : [];
+        const runs     = runsRes.status     === "fulfilled" ? runsRes.value?.workflow_runs||[] : [];
         const repoInfo = repoRes.status     === "fulfilled" ? repoRes.value     : {};
 
         // Always include full test details from lastReports
@@ -247,32 +260,36 @@ async function executeTool(name, args, phone) {
         } : null;
 
         return JSON.stringify({
-          repo:        `${repoInfo.full_name} | ⭐${repoInfo.stargazers_count} | ${repoInfo.language} | Branch: ${repoInfo.default_branch}`,
-          openIssues:  issues.map(i => `#${i.number} [${i.labels?.map(l=>l.name).join(',')||'none'}] "${i.title}" @${i.user?.login}`),
-          openPRs:     prs.map(p => `#${p.number} "${p.title}" ${p.head?.ref}→${p.base?.ref}`),
-          recentCommits: commits.slice(0,5).map(c => `${c.sha?.slice(0,7)} ${c.commit?.author?.name}: ${c.commit?.message?.split('\n')[0]}`),
-          branches:    branches.map(b => b.name),
-          workflowRuns: runs.map(w => `${w.conclusion==='success'?'✅':'❌'} "${w.name}" ${w.status}/${w.conclusion||'running'}`),
-          testResults: testDetails || 'No test results loaded yet — run tests first',
+          repo:        `${repoInfo.full_name} | ⭐${repoInfo.stargazers_count||0} | ${repoInfo.language||'unknown'} | Branch: ${repoInfo.default_branch||repo.branch}`,
+          openIssues:  issues.slice(0,10).map(i => `#${i.number} [${i.labels?.map(l=>l.name).join(',')||'none'}] "${i.title}"`),
+          openPRs:     prs.slice(0,10).map(p => `#${p.number} "${p.title}" ${p.head?.ref||'?'}→${p.base?.ref||repo.branch}`),
+          recentCommits: commits.slice(0,5).map(c => `${c.sha?.slice(0,7)} ${c.commit?.author?.name||'?'}: ${c.commit?.message?.split('\n')[0]}`),
+          branches:    branches.slice(0,15).map(b => b.name),
+          workflowRuns: runs.slice(0,5).map(w => `${w.conclusion==='success'?'✅':'❌'} ${w.name} (${w.status}/${w.conclusion||'running'})`),
+          testResults: testDetails || 'No test results — run tests first',
         });
       } catch (err) {
-        return `Failed to get repo context: ${err.message}`;
+        return `❌ Failed to get repo context: ${err.message}`;
       }
     }
 
     case "create_issues": {
       try {
-        const report = lastReports[phone];
-        if (!report?.summary) {
+        let report = lastReports[phone];
+        if (!report?.summary?.failedTests?.length) {
           // Try to load latest report
           const runsRes = await ghGet(`/repos/${repo.repo}/actions/runs?per_page=10&status=completed`);
-          for (const run of runsRes.workflow_runs) {
+          for (const run of runsRes.workflow_runs||[]) {
             await loadReport(phone, repo, run.id, run);
-            if (lastReports[phone]?.summary) break;
+            if (lastReports[phone]?.summary?.failedTests?.length) {
+              report = lastReports[phone];
+              break;
+            }
           }
         }
-        const r = lastReports[phone];
-        if (!r?.summary?.failedTests?.length) return "No failed tests found. Nothing to create issues for.";
+        
+        const r = report || lastReports[phone];
+        if (!r?.summary?.failedTests?.length) return `❌ No failed tests found.`;
 
         // Check existing issues to avoid duplicates
         const existing = await ghGet(`/repos/${repo.repo}/issues?state=open&per_page=100`);
@@ -281,61 +298,64 @@ async function executeTool(name, args, phone) {
         for (const test of r.summary.failedTests) {
           const dup = existing.find(i => {
             const t = i.title.toLowerCase().replace("🐛 [playwright] ", "").trim();
-            return t === test.title.toLowerCase().trim() || t.includes(test.title.toLowerCase().trim());
+            return t.includes(test.title.toLowerCase().trim());
           });
-          if (dup) { skipped.push(`#${dup.number} already exists for "${test.title}"`); continue; }
+          if (dup) { skipped.push(`#${dup.number}`); continue; }
 
           const body =
             `## 🐛 Failed Playwright Test\n\n` +
             `**Test:** \`${test.title}\`\n` +
-            `**File:** \`${test.file || "unknown"}\`\n` +
-            `**Repo:** \`${repo.repo}\`\n\n` +
-            `## Error\n\`\`\`\n${test.error || "No error"}\n\`\`\`\n\n` +
-            `## Reproduce\n\`\`\`bash\nnpx playwright test --grep "${test.title}"\n\`\`\`\n\n` +
-            `**Run:** ${r.runUrl}\n\n---\n*Auto-created by WhatsApp QA Bot 🤖*`;
+            `**File:** \`${test.file || "unknown"}\`\n\n` +
+            `## Error\n\`\`\`\n${(test.error||"No error").slice(0,500)}\n\`\`\`\n\n` +
+            `**Run:** ${r.runUrl}\n\n*Auto-created by QA Bot*`;
 
           const issue = await axios.post(
             `https://api.github.com/repos/${repo.repo}/issues`,
-            { title: `🐛 [Playwright] ${test.title}`, body, labels: ["bug", "playwright", "automated"] },
+            { title: `🐛 [Playwright] ${test.title}`, body, labels: ["bug", "playwright"] },
             { headers: { ...ghHeaders(), "Content-Type": "application/json" } }
           );
-          created.push(`#${issue.data.number} "${test.title}" → ${issue.data.html_url}`);
+          created.push(`#${issue.data.number}`);
         }
-        return `Created ${created.length} issue(s): ${created.join(', ')}. ${skipped.length ? `Skipped (duplicates): ${skipped.join(', ')}` : ''}`;
+        return `✅ Created ${created.length} issue(s): ${created.join(', ')}${skipped.length ? ` (Skipped duplicates: ${skipped.join(',')})` : ''}`;
       } catch (err) {
-        return `Failed to create issues: ${err.message}`;
+        return `❌ Failed to create issues: ${err.message}`;
       }
     }
 
     case "fix_issue": {
+      if (!issueNumber) return `❌ Issue number missing. Usage: fix issue #123`;
       try {
-        const issue = await ghGet(`/repos/${repo.repo}/issues/${args.issue_number}`);
+        const issue = await ghGet(`/repos/${repo.repo}/issues/${issueNumber}`);
+        if (!issue) return `❌ Issue #${issueNumber} not found`;
+        
         const testTitle = issue.title.replace("🐛 [Playwright] ", "").trim();
         const testFile  = extractField(issue.body, "File") || "tests/";
         const error     = extractError(issue.body);
         const runUrl    = extractRunUrl(issue.body) || `https://github.com/${repo.repo}/actions`;
 
-        console.log(`🔧 Fixing #${args.issue_number}: "${testTitle}" file: ${testFile}`);
+        console.log(`🔧 Fixing #${issueNumber}: "${testTitle}"`);
 
         await axios.post(
           `https://api.github.com/repos/${repo.repo}/actions/workflows/${repo.aiFixWorkflow}/dispatches`,
-          { ref: repo.branch, inputs: { test_file: testFile, test_title: testTitle, issue_number: String(args.issue_number), phone_number: phone } },
+          { ref: repo.branch, inputs: { test_file: testFile, test_title: testTitle, issue_number: String(issueNumber), phone_number: phone } },
           { headers: ghHeaders() }
         );
 
-        // Store pending fix context
-        pendingFixes[`${phone}_${args.issue_number}`] = { repo, issue, testTitle, testFile, error, runUrl };
-
-        return `AI Fix Agent triggered for issue #${args.issue_number} ("${testTitle}"). GitHub Actions is running the real test to capture DOM and error. PR link will be sent automatically when ready (~3-5 min).`;
+        pendingFixes[`${phone}_${issueNumber}`] = { repo, issue, testTitle, testFile, error, runUrl };
+        return `✅ AI Fix triggered for #${issueNumber}. PR coming in ~3-5 min. Say "status" to check.`;
       } catch (err) {
-        return `Failed to trigger fix for #${args.issue_number}: ${err.message}`;
+        return `❌ Failed to fix #${issueNumber}: ${err.message}`;
       }
     }
 
     case "execute_pr": {
+      if (!prNumber) return `❌ PR number missing. Usage: execute PR #123`;
       try {
-        const pr = await ghGet(`/repos/${repo.repo}/pulls/${args.pr_number}`);
-        const prBranch = pr.head.ref;
+        const pr = await ghGet(`/repos/${repo.repo}/pulls/${prNumber}`);
+        if (!pr) return `❌ PR #${prNumber} not found`;
+        
+        const prBranch = pr.head?.ref;
+        if (!prBranch) return `❌ Could not get PR branch`;
 
         try {
           await axios.post(
@@ -353,42 +373,45 @@ async function executeTool(name, args, phone) {
 
         await sleep(12000);
         const runsRes      = await ghGet(`/repos/${repo.repo}/actions/runs?per_page=1`);
-        const trackedRunId = runsRes.workflow_runs[0]?.id;
+        const trackedRunId = runsRes.workflow_runs?.[0]?.id;
+        if (!trackedRunId) return `❌ Failed to start tests on PR`;
+        
         let attempt = 0;
-        while (true) {
+        while (attempt < 30) {
           await sleep(30000);
           const run = await ghGet(`/repos/${repo.repo}/actions/runs/${trackedRunId}`);
           if (run.status === "completed") {
             await loadReport(phone, repo, trackedRunId, run);
             const s = lastReports[phone]?.summary;
             if (s?.failed === 0) {
-              // Auto comment on PR
-              await axios.post(`https://api.github.com/repos/${repo.repo}/issues/${args.pr_number}/comments`,
-                { body: `## ✅ Tests Passed\n\nPassed: ${s.passed}, Failed: ${s.failed}\n\n*Verified by WhatsApp QA Bot 🤖*` },
+              await axios.post(`https://api.github.com/repos/${repo.repo}/issues/${prNumber}/comments`,
+                { body: `✅ Tests passed (${s.passed}p) Ready to merge!` },
                 { headers: { ...ghHeaders(), "Content-Type": "application/json" } }
               );
-              return `✅ PR #${args.pr_number} tests PASSED (${s.passed} passed). Safe to merge! ${run.html_url}`;
+              return `✅ PR #${prNumber} PASSED! ${s.passed}p ❌${s.failed}f. Safe to merge.`;
             } else {
-              return `❌ PR #${args.pr_number} still failing: ${s?.failedTests?.map(t=>`"${t.title}"`).join(', ')}. ${run.html_url}`;
+              return `❌ PR #${prNumber} failed: ${s?.failedTests?.map(t=>`"${t.title}"`).join(', ')}`;
             }
           }
-          console.log(`⏳ PR run [${Math.round(attempt*30/60)}m]: ${run.status}`);
+          console.log(`⏳ PR #${prNumber} [${Math.round(attempt*30/60)}m]`);
           attempt++;
         }
+        return `❌ PR test timeout`;
       } catch (err) {
-        return `Failed to execute PR: ${err.message}`;
+        return `❌ Failed to execute PR: ${err.message}`;
       }
     }
 
     case "delete_branch": {
+      if (!branchName) return `❌ Branch name missing. Usage: delete branch feature-x`;
       try {
         await axios.delete(
-          `https://api.github.com/repos/${repo.repo}/git/refs/heads/${args.branch_name}`,
+          `https://api.github.com/repos/${repo.repo}/git/refs/heads/${branchName}`,
           { headers: ghHeaders() }
         );
-        return `Branch "${args.branch_name}" deleted successfully.`;
+        return `✅ Branch "${branchName}" deleted`;
       } catch (err) {
-        return `Failed to delete branch "${args.branch_name}": ${err.response?.data?.message || err.message}`;
+        return `❌ Failed to delete "${branchName}": ${err.response?.data?.message || err.message}`;
       }
     }
 
@@ -396,52 +419,60 @@ async function executeTool(name, args, phone) {
       try {
         const branches = await ghGet(`/repos/${repo.repo}/branches?per_page=100`);
         const aiFixBranches = branches.filter(b => b.name.startsWith('ai-fix-'));
-        const deleted = [], failed = [];
+        if (!aiFixBranches.length) return `✅ No ai-fix branches to clean`;
+        
+        const deleted = [];
         for (const b of aiFixBranches) {
           try {
             await axios.delete(`https://api.github.com/repos/${repo.repo}/git/refs/heads/${b.name}`, { headers: ghHeaders() });
             deleted.push(b.name);
-          } catch (_) { failed.push(b.name); }
+          } catch (_) {}
         }
-        return `Deleted ${deleted.length} ai-fix branches. ${failed.length ? `Failed: ${failed.join(', ')}` : ''}`;
+        return `✅ Cleaned ${deleted.length}/${aiFixBranches.length} ai-fix branches`;
       } catch (err) {
-        return `Failed to cleanup branches: ${err.message}`;
+        return `❌ Failed to cleanup branches: ${err.message}`;
       }
     }
 
     case "merge_pr": {
+      if (!prNumber) return `❌ PR number missing. Usage: merge PR #123`;
       try {
+        const pr = await ghGet(`/repos/${repo.repo}/pulls/${prNumber}`);
+        if (!pr) return `❌ PR #${prNumber} not found`;
+        if (pr.merged) return `✅ PR #${prNumber} already merged`;
+        
         const res = await axios.put(
-          `https://api.github.com/repos/${repo.repo}/pulls/${args.pr_number}/merge`,
+          `https://api.github.com/repos/${repo.repo}/pulls/${prNumber}/merge`,
           { merge_method: "squash" },
           { headers: { ...ghHeaders(), "Content-Type": "application/json" } }
         );
-        return `PR #${args.pr_number} merged successfully. SHA: ${res.data.sha?.slice(0,7)}`;
+        return `✅ PR #${prNumber} merged successfully`;
       } catch (err) {
-        return `Failed to merge PR #${args.pr_number}: ${err.response?.data?.message || err.message}`;
+        return `❌ Failed to merge PR #${prNumber}: ${err.response?.data?.message || err.message}`;
       }
     }
 
     case "close_issue": {
+      if (!issueNumber) return `❌ Issue number missing. Usage: close issue #123`;
       try {
         if (args.comment) {
-          await axios.post(`https://api.github.com/repos/${repo.repo}/issues/${args.issue_number}/comments`,
+          await axios.post(`https://api.github.com/repos/${repo.repo}/issues/${issueNumber}/comments`,
             { body: args.comment },
             { headers: { ...ghHeaders(), "Content-Type": "application/json" } }
           );
         }
-        await axios.patch(`https://api.github.com/repos/${repo.repo}/issues/${args.issue_number}`,
+        await axios.patch(`https://api.github.com/repos/${repo.repo}/issues/${issueNumber}`,
           { state: "closed" },
           { headers: { ...ghHeaders(), "Content-Type": "application/json" } }
         );
-        return `Issue #${args.issue_number} closed.`;
+        return `✅ Issue #${issueNumber} closed`;
       } catch (err) {
-        return `Failed to close issue #${args.issue_number}: ${err.message}`;
+        return `❌ Failed to close issue #${issueNumber}: ${err.message}`;
       }
     }
 
     default:
-      return `Unknown tool: ${name}`;
+      return `❌ Unknown tool: ${name}`;
   }
 }
 
@@ -469,37 +500,65 @@ EXPERTISE:
 
 AVAILABLE REPOS: ${REPOS.map(r => `${r.id}. ${r.name} (${r.repo})`).join(', ')}
 
-BEHAVIOUR:
-- Always call get_repo_context before answering any question about the repo — data must be live, never guessed
-- Do ONLY what user explicitly asks. NEVER take extra actions
-- Answers: max 2 lines, factual, direct. Use real numbers and names from tool data
-- For lists (test names, issues, PRs): show them clearly, one per line
-- Test names ARE in testResults.passedTests/failedTests/skippedTests — always use them
-- Never say "data unavailable" if tool returned it
-- repo_id defaults to 1 unless user specifies
-- if in any case rate limits are hit, respond with "retry after 15s or contact support admin team - cspandey3000@gmail.com"
-- if user ask some details about test failures, always refer to testResults.failedTests for real test names and errors, never guess
+BEHAVIOUR & PRINCIPLES:
+- **Always call get_repo_context first** before answering any question about repo state — data must be live, never guessed
+- **Do ONLY what user explicitly asks** — NEVER take extra actions like "let me also close this issue"
+- **Max 2 lines per response**, factual, direct. Use real numbers and names from tool data
+- **For lists** (test names, issues, PRs): show them clearly, one per line with numbers
+- **Test data is always in get_repo_context response** → testResults.passedTests/failedTests/skippedTests arrays
+- **Never say "data unavailable"** if a tool returned data — refer to it
+- **repo_id defaults to 1** (HCL Playwright) unless user specifies
 
-CLARIFICATION RULES (important):
-- If the request is ambiguous or missing required info, ask ONE short clarifying question — do NOT call any tool yet
-- Examples of when to ask:
-  * "fix the issue" (no number) → ask "Which issue number? e.g. fix #160"
-  * "delete branch" (no name) → ask "Which branch name?"
-  * "run tests on branch" (no branch) → ask "Which branch?"
-  * "create a PR" (no context) → ask "PR for which branch/fix?"
-- If request is clear → act immediately, no need to ask
-- Never ask more than one question at a time
+ERROR HANDLING:
+- Rate limit (429) → "Service limit hit, retry after 15 seconds. Contact: cspandey3000@gmail.com"
+- Tool execution fails → "Tool failed: [actual error]. Check if issue/PR/branch exists. Contact: cspandey3000@gmail.com"
+- Missing artifact → "No test report yet. Try 'run tests' first"
+- Invalid number format → "Invalid: must be integer (e.g. issue 42, not '42' or 'forty-two')"
 
-TOOL USAGE (only when user clearly asks):
-- get_repo_context → any question about repo state, issues, PRs, commits, branches, test results
-- run_tests → only when user says run/trigger/execute tests
-- create_issues → only when user says create/log/raise issues
-- fix_issue → only when user says fix issue #N (needs a number)
-- execute_pr → only when user says execute/run/verify PR #N (needs a number)
-- merge_pr → only when user says merge PR #N (needs a number)
-- delete_branch → only when user says delete branch (needs a name)
-- cleanup_branches → only when user says cleanup/delete all ai-fix branches
-- close_issue → only when user says close issue #N (needs a number)`,
+SMART INTENT DETECTION:
+When user mentions specific test names → **always search testResults for exact match**:
+- "fix Herokuapp Login Validation" → find issue #N with that test → call fix_issue with correct #
+- "create issue for OrangeHRM test" → create_issues then filter by test name containing "OrangeHRM"
+- "show Stripe Payment test" → get_repo_context then list that test from failedTests/passedTests arrays
+
+When request is ambiguous about WHICH action:
+- "check the PR" → ask "Which PR number?" before any tool call
+- "fix it" → ask "Which issue number?" before any tool call
+- "run on branch" → ask "Which branch name?" before any tool call
+
+CLARIFICATION RULES:
+- **If missing required info → ask ONE short question ONLY, do NOT call tools yet**
+- **If clear → act immediately, do NOT ask for confirmation**
+- Maximum 1 follow-up question per message
+
+TOOL PARAMETER RULES - CRITICAL:
+- **All numeric IDs must be INTEGERS** (not strings): repo_id: 1, issue_number: 42, pr_number: 5
+- **Branch names are STRINGS**: delete_branch "ai-fix-123" or "feature/xyz"
+- **repo_id is always 1 for HCL Playwright** unless user says "repo 2" or similar
+
+TOOL DECISIONS (only call when user clearly asks):
+- get_repo_context → "show/tell me about repo" or any question about issues/PRs/tests/commits/branches
+- run_tests → "run tests" or "trigger tests" or "execute tests"
+- create_issues → "create issue(s)" or "log issue(s)". Always check testResults.failedTests first
+- fix_issue → "fix issue #N" (must have issue number). Searches issue body for test details
+- execute_pr → "execute PR #N" or "run tests on PR #N" (must have PR number)
+- merge_pr → "merge PR #N" (must have PR number). Returns success/failure with details
+- delete_branch → "delete branch X" (must have branch name)
+- cleanup_branches → "cleanup ai-fix branches" or "delete all fix branches"
+- close_issue → "close issue #N" (must have issue number)
+
+RESPONSE EXAMPLES:
+User: "run tests"
+→ Call run_tests tool → Return: "✅ Tests passed: 42p. All clean!"
+
+User: "fix Herokuapp Login Validation"
+→ Call get_repo_context → Find issue #N with that test → Call fix_issue(N) → Return: "✅ AI Fix started for #N"
+
+User: "show failed tests"
+→ Call get_repo_context → Return test list from testResults.failedTests with names and errors
+
+User: "create issue for OrangeHRM"
+→ Call get_repo_context → Filter failedTests containing "OrangeHRM" → Call create_issues → Return created issue #s`,
     },
     ...history,
     { role: "user", content: userMessage },
@@ -631,43 +690,130 @@ app.post("/ai-fix-callback", async (req, res) => {
 
 // ─── Groq fix generation ──────────────────────────────────────────
 async function generateFix(testTitle, testFile, testResult, artifacts, sourceFiles, runUrl) {
-  const error        = testResult?.error || testResult?.failedTests?.[0]?.error || "No error";
-  const testContent  = sourceFiles?.[testFile] || sourceFiles?.[Object.keys(sourceFiles||{}).find(p=>p.includes(path.basename(testFile||'')))] || "";
-  const domSnapshot  = artifacts?.domSnapshot || "";
-
-  // Extract only relevant DOM
-  const selectors = [...(testContent.matchAll(/(?:locator|fill|click|waitFor\w*)\s*\(\s*['"`]([^'"`\n]{2,60})['"`]/g))].map(m=>m[1]).slice(0,10);
-  const relevantDom = selectors.length > 0
-    ? (domSnapshot.match(/<[^>]+>[^<]*/g)||[]).filter(t=>selectors.some(s=>t.includes(s.replace(/^[#.]/,'')))).slice(0,15).join('\n').slice(0,1500)
-    : domSnapshot.slice(0,1000);
-
-  const pageObj = Object.entries(sourceFiles||{}).find(([p])=>p.includes('pages/')||p.toLowerCase().includes('page'));
-
-  const prompt =
-    `Fix this Playwright test. Minimal change only.\n\n` +
-    `ERROR: ${error.slice(0,400)}\n\n` +
-    `TEST (${testFile}):\n\`\`\`js\n${testContent.slice(0,2500)}\n\`\`\`\n\n` +
-    `${pageObj ? `PAGE OBJECT (${pageObj[0]}):\n\`\`\`js\n${pageObj[1].slice(0,1500)}\n\`\`\`` : ''}\n\n` +
-    `${relevantDom ? `RELEVANT DOM:\n\`\`\`html\n${relevantDom}\n\`\`\`` : ''}\n\n` +
-    `VALID PATHS: ${Object.keys(sourceFiles||{}).map(p=>`\`${p}\``).join(', ') || `\`${testFile}\``}\n\n` +
-    `Return JSON: {"prTitle":"fix:...","explanation":"...","rootCause":"...","fixes":[{"path":"...","message":"...","content":"<full file>"}]}`;
-
   try {
-    const res = await axios.post(NVIDIA_URL, {
-      model:           NVIDIA_MODEL,
-      messages:        [
-        { role: "system", content: "Expert Playwright engineer. Return ONLY valid JSON. No markdown." },
-        { role: "user",   content: prompt }
-      ],
-      temperature:     0.1,
-      max_tokens:      4096,
-    }, { headers: { Authorization: `Bearer ${NVIDIA_API_KEY}`, "Accept": "application/json" } });
+    const error = testResult?.error || testResult?.failedTests?.[0]?.error || "No error";
+    
+    if (!testFile || !sourceFiles || Object.keys(sourceFiles).length === 0) {
+      console.log("❌ generateFix: Missing testFile or sourceFiles");
+      return null;
+    }
 
-    const result = JSON.parse(res.data.choices[0].message.content);
-    console.log(`🧠 Fix: "${result.prTitle}" | ${result.fixes?.length} file(s) | paths: ${result.fixes?.map(f=>f.path).join(',')}`);
+    // Find test content
+    const testContent = sourceFiles?.[testFile] || 
+      sourceFiles?.[Object.keys(sourceFiles||{}).find(p => p.includes(path.basename(testFile||'')))] || 
+      "";
+    
+    if (!testContent) {
+      console.log(`⚠️ Could not find test file: ${testFile}`);
+      return null;
+    }
+
+    const domSnapshot = artifacts?.domSnapshot || "";
+
+    // Extract relevant selectors from test code
+    const selectors = [...(testContent.matchAll(/(?:locator|fill|click|waitFor\w*)\s*\(\s*['"`]([^'"`\n]{2,60})['"`]/g))]
+      .map(m => m[1])
+      .slice(0, 10);
+
+    // Extract relevant DOM elements
+    const relevantDom = selectors.length > 0
+      ? (domSnapshot.match(/<[^>]+>[^<]*/g) || [])
+          .filter(t => selectors.some(s => t.includes(s.replace(/^[#.]/, ""))))
+          .slice(0, 15)
+          .join("\n")
+          .slice(0, 1500)
+      : domSnapshot.slice(0, 1000);
+
+    // Find page object file
+    const pageObj = Object.entries(sourceFiles || {}).find(([p]) => p.includes("pages/") || p.toLowerCase().includes("page"));
+
+    const prompt =
+      `Fix this Playwright test. Minimal change only.\n\n` +
+      `ERROR: ${String(error).slice(0, 400)}\n\n` +
+      `TEST (${testFile}):\n\`\`\`js\n${testContent.slice(0, 2500)}\n\`\`\`\n\n` +
+      `${pageObj ? `PAGE OBJECT (${pageObj[0]}):\n\`\`\`js\n${pageObj[1].slice(0, 1500)}\n\`\`\`` : ""}\n\n` +
+      `${relevantDom ? `RELEVANT DOM:\n\`\`\`html\n${relevantDom}\n\`\`\`` : ""}\n\n` +
+      `VALID PATHS: ${Object.keys(sourceFiles || {}).map(p => `\`${p}\``).join(", ") || `\`${testFile}\``}\n\n` +
+      `RULES: Return ONLY valid JSON (no markdown). Include prTitle, explanation, rootCause, fixes array.\n` +
+      `fixes[].path MUST be from VALID PATHS list. fixes[].content must be complete file.`;
+
+    console.log(`🧠 Calling NVIDIA for fix: "${testTitle}" in ${testFile}`);
+
+    const res = await axios.post(
+      NVIDIA_URL,
+      {
+        model: NVIDIA_MODEL,
+        messages: [
+          { role: "system", content: "You are an expert Playwright engineer. Return ONLY valid JSON. Do not use markdown code blocks." },
+          { role: "user", content: prompt },
+        ],
+        temperature: 0.1,
+        max_tokens: 4096,
+      },
+      { headers: { Authorization: `Bearer ${NVIDIA_API_KEY}`, "Accept": "application/json" } }
+    );
+
+    if (!res.data?.choices?.[0]?.message?.content) {
+      console.log("❌ generateFix: Empty response from NVIDIA");
+      return null;
+    }
+
+    let content = res.data.choices[0].message.content.trim();
+    
+    // Extract JSON if wrapped in markdown code blocks
+    const jsonMatch = content.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
+    if (jsonMatch) {
+      content = jsonMatch[1].trim();
+    }
+
+    let result;
+    try {
+      result = JSON.parse(content);
+    } catch (parseErr) {
+      console.log(`❌ JSON parse error: ${parseErr.message}`);
+      console.log(`Response (first 300 chars): ${content.slice(0, 300)}`);
+      return null;
+    }
+
+    // Validate result
+    if (!result || typeof result !== "object") {
+      console.log("❌ Result is not an object");
+      return null;
+    }
+
+    if (!result.prTitle || !result.explanation || !result.rootCause) {
+      console.log("❌ Missing required fields: prTitle, explanation, or rootCause");
+      return null;
+    }
+
+    if (!Array.isArray(result.fixes) || result.fixes.length === 0) {
+      console.log("❌ fixes is not an array or is empty");
+      return null;
+    }
+
+    // Validate and correct file paths
+    const validPaths = Object.keys(sourceFiles || {});
+    for (const fix of result.fixes) {
+      if (!fix.path || !fix.message || !fix.content) {
+        console.log(`⚠️ Invalid fix: missing path, message, or content`);
+        continue;
+      }
+
+      if (!validPaths.includes(fix.path)) {
+        const corrected = validPaths.find(p => p.includes(fix.path) || fix.path.includes(p));
+        if (corrected) {
+          console.log(`🔧 Path auto-corrected: ${fix.path} → ${corrected}`);
+          fix.path = corrected;
+        } else {
+          console.log(`⚠️ Path "${fix.path}" not found in source files. Will attempt to create/update.`);
+        }
+      }
+    }
+
+    console.log(`✅ Fix ready: "${result.prTitle}" | Files: ${result.fixes.map(f => f.path).join(", ")}`);
     return result;
   } catch (err) {
-    console.error("❌ generateFix:", err.message);
+    console.error(`❌ generateFix exception: ${err.message}`);
     return null;
   }
 }
@@ -724,63 +870,233 @@ async function ghGet(path) {
   return res.data;
 }
 
-async function getDefaultBranchSHA(repo, headers) {
+async function getDefaultBranchSHA(repo, headers = ghHeaders()) {
   try {
-    const res = await axios.get(`https://api.github.com/repos/${repo.repo}/git/ref/heads/${repo.branch}`, { headers });
+    const repoInfo = await ghGet(`/repos/${repo.repo}`);
+    if (!repoInfo.default_branch) {
+      console.log(`⚠️ No default branch found for ${repo.repo}`);
+      return null;
+    }
+    const res = await axios.get(`https://api.github.com/repos/${repo.repo}/git/ref/heads/${repoInfo.default_branch}`, { headers });
     return res.data.object.sha;
-  } catch (_) { return null; }
+  } catch (err) {
+    console.log(`⚠️ Failed to get default branch SHA: ${err.message}`);
+    return null;
+  }
 }
 
-async function createBranch(repo, branchName, sha, headers) {
-  await axios.post(`https://api.github.com/repos/${repo.repo}/git/refs`, { ref: `refs/heads/${branchName}`, sha }, { headers });
-}
-
-async function commitFile(repo, branchName, filePath, content, message, headers) {
-  let existingSha;
+async function createBranch(repo, branchName, sha = null, headers = ghHeaders()) {
   try {
-    const ex = await axios.get(`https://api.github.com/repos/${repo.repo}/contents/${filePath}?ref=${branchName}`, { headers });
-    existingSha = ex.data.sha;
-  } catch (_) {}
-  const payload = { message, content: Buffer.from(content).toString("base64"), branch: branchName };
-  if (existingSha) payload.sha = existingSha;
-  await axios.put(`https://api.github.com/repos/${repo.repo}/contents/${filePath}`, payload, { headers });
+    const fromSha = sha || (await getDefaultBranchSHA(repo, headers));
+    if (!fromSha) {
+      console.log(`❌ Cannot create branch ${branchName}: no base SHA available`);
+      return null;
+    }
+    const res = await axios.post(`https://api.github.com/repos/${repo.repo}/git/refs`, { ref: `refs/heads/${branchName}`, sha: fromSha }, { headers });
+    console.log(`✅ Branch created: ${branchName}`);
+    return res.data;
+  } catch (err) {
+    console.log(`❌ Failed to create branch ${branchName}: ${err.message}`);
+    return null;
+  }
+}
+
+async function commitFile(repo, branchName, filePath, content, message, headers = ghHeaders()) {
+  try {
+    let existingSha;
+    try {
+      const ex = await axios.get(`https://api.github.com/repos/${repo.repo}/contents/${filePath}?ref=${branchName}`, { headers });
+      existingSha = ex.data.sha;
+    } catch (_) {}
+    const payload = { message, content: Buffer.from(content).toString("base64"), branch: branchName };
+    if (existingSha) payload.sha = existingSha;
+    const res = await axios.put(`https://api.github.com/repos/${repo.repo}/contents/${filePath}`, payload, { headers });
+    console.log(`✅ File committed: ${filePath}`);
+    return res.data;
+  } catch (err) {
+    console.log(`❌ Failed to commit ${filePath}: ${err.message}`);
+    return null;
+  }
 }
 
 async function loadReport(phone, repo, runId, run) {
   try {
-    const artRes  = await ghGet(`/repos/${repo.repo}/actions/runs/${runId}/artifacts`);
-    const jsonArt = artRes.artifacts.find(a => a.name === "json-report");
-    if (!jsonArt) { lastReports[phone] = { repo, repoName: repo.name, runUrl: run.html_url, conclusion: run.conclusion, summary: null, fetchedAt: Date.now() }; return; }
-    const dlRes = await axios.get(`https://api.github.com/repos/${repo.repo}/actions/artifacts/${jsonArt.id}/zip`, { headers: { Authorization: `token ${GITHUB_TOKEN}` }, responseType: "arraybuffer", maxRedirects: 5 });
+    if (!runId || !repo) { 
+      console.log("⚠️ loadReport: missing runId or repo");
+      return;
+    }
+    
+    const artRes = await ghGet(`/repos/${repo.repo}/actions/runs/${runId}/artifacts`);
+    const artifacts = artRes.artifacts || [];
+    
+    if (artifacts.length === 0) {
+      console.log(`⚠️ No artifacts found for run ${runId}`);
+      lastReports[phone] = { repo: repo.repo, repoName: repo.name, runUrl: run?.html_url, conclusion: run?.conclusion, summary: null, fetchedAt: Date.now() };
+      return;
+    }
+    
+    const jsonArt = artifacts.find(a => a.name.includes("json-report") || a.name.includes("playwright") || a.name.includes("test-report"));
+    if (!jsonArt) {
+      console.log(`⚠️ No test report artifact found. Available: ${artifacts.map(a=>a.name).join(', ')}`);
+      lastReports[phone] = { repo: repo.repo, repoName: repo.name, runUrl: run?.html_url, conclusion: run?.conclusion, summary: null, fetchedAt: Date.now() };
+      return;
+    }
+    
+    console.log(`📦 Downloading artifact: ${jsonArt.name} (${Math.round(jsonArt.size_in_bytes / 1024)}KB)`);
+    const dlRes = await axios.get(jsonArt.archive_download_url, { 
+      headers: { Authorization: `token ${GITHUB_TOKEN}` }, 
+      responseType: "arraybuffer", 
+      maxRedirects: 5,
+      timeout: 30000
+    });
+    
+    if (!dlRes.data || dlRes.data.length === 0) {
+      console.log("⚠️ Downloaded artifact is empty");
+      return;
+    }
+    
     const { default: JSZip } = await import("jszip");
-    const zip  = await JSZip.loadAsync(dlRes.data);
-    const file = zip.file("playwright-results.json");
-    if (!file) return;
-    const summary = extractSummary(JSON.parse(await file.async("string")));
-    lastReports[phone] = { repo, repoName: repo.name, runUrl: run.html_url, conclusion: run.conclusion, summary, fetchedAt: Date.now() };
-    console.log(`✅ Report: ${summary.passed}p ${summary.failed}f ${summary.skipped}s`);
-  } catch (err) { console.error("❌ loadReport:", err.message); }
+    const zip = await JSZip.loadAsync(dlRes.data);
+    
+    // Find JSON report file
+    let reportFile = zip.file("playwright-results.json") || zip.file("test-results/results.json") || zip.file("results.json");
+    
+    // If not found, search for any JSON file
+    if (!reportFile) {
+      const files = Object.keys(zip.files);
+      const jsonFiles = files.filter(f => f.endsWith(".json"));
+      reportFile = jsonFiles.length > 0 ? zip.file(jsonFiles[0]) : null;
+      if (reportFile) console.log(`ℹ️ Using JSON file: ${jsonFiles[0]}`);
+    }
+    
+    if (!reportFile) {
+      console.log(`⚠️ No JSON report found in artifact. Files: ${Object.keys(zip.files).slice(0,10).join(', ')}`);
+      return;
+    }
+    
+    const reportContent = await reportFile.async("string");
+    if (!reportContent || reportContent.trim().length === 0) {
+      console.log("⚠️ Report file is empty");
+      return;
+    }
+    
+    let report;
+    try {
+      report = JSON.parse(reportContent);
+    } catch (parseErr) {
+      console.log(`⚠️ Failed to parse JSON: ${parseErr.message}`);
+      return;
+    }
+    
+    if (!report || typeof report !== 'object') {
+      console.log("⚠️ Invalid report structure");
+      return;
+    }
+    
+    const summary = extractSummary(report);
+    lastReports[phone] = {
+      repo: repo.repo,
+      repoName: repo.name || repo.repo.split('/')[1],
+      runUrl: run?.html_url || `https://github.com/${repo.repo}/actions/runs/${runId}`,
+      conclusion: run?.conclusion || "completed",
+      summary,
+      fetchedAt: Date.now()
+    };
+    
+    console.log(`✅ Report loaded: ${summary.passed}p ${summary.failed}f ${summary.skipped}s (${summary.duration}s)`);
+  } catch (err) {
+    console.error(`❌ loadReport: ${err.message} (${err.code || 'unknown'})`);
+  }
 }
 
 function extractSummary(report) {
-  const s = { passed:0, failed:0, skipped:0, total:0, duration:0, failedTests:[], skippedTests:[], passedTests:[] };
-  function walk(suite, fp="") {
-    const file = suite.file||fp;
-    for (const spec of suite.specs||[]) {
-      for (const test of spec.tests||[]) {
-        const status = test.status||test.results?.[0]?.status;
-        const error  = test.results?.[0]?.error?.message||null;
-        s.duration  += test.results?.[0]?.duration||0;
-        if (status==="passed"||status==="expected")        { s.passed++;  s.passedTests.push({title:spec.title,file}); }
-        else if (status==="failed"||status==="unexpected") { s.failed++;  s.failedTests.push({title:spec.title,file,error}); }
-        else if (status==="skipped"||status==="pending")   { s.skipped++; s.skippedTests.push({title:spec.title,file}); }
+  const s = { passed: 0, failed: 0, skipped: 0, total: 0, duration: 0, failedTests: [], skippedTests: [], passedTests: [] };
+  
+  if (!report || typeof report !== 'object') {
+    console.log("⚠️ Invalid report format");
+    return s;
+  }
+  
+  function walk(suite, fp = "") {
+    if (!suite || typeof suite !== 'object') return;
+    
+    const file = suite.file || suite.path || fp || "unknown";
+    
+    // Walk specs (Playwright format)
+    for (const spec of suite.specs || []) {
+      if (!spec || typeof spec !== 'object') continue;
+      
+      for (const test of spec.tests || []) {
+        if (!test || typeof test !== 'object') continue;
+        
+        const status = test.status || test.results?.[0]?.status || "unknown";
+        const error = test.results?.[0]?.error?.message || test.error?.message || null;
+        const duration = test.results?.[0]?.duration || test.duration || 0;
+        
+        s.duration += duration;
+        
+        const testTitle = spec.title || test.title || `Test@${file}`;
+        
+        if (status === "passed" || status === "expected") {
+          s.passed++;
+          s.passedTests.push({ title: testTitle, file });
+        } else if (status === "failed" || status === "unexpected") {
+          s.failed++;
+          s.failedTests.push({ title: testTitle, file, error: error ? error.slice(0, 500) : "No error" });
+        } else if (status === "skipped" || status === "pending") {
+          s.skipped++;
+          s.skippedTests.push({ title: testTitle, file });
+        } else {
+          console.log(`⚠️ Unknown test status: "${status}"`);
+        }
       }
     }
-    for (const child of suite.suites||[]) walk(child,file);
+    
+    // Walk tests (Direct format)
+    for (const test of suite.tests || []) {
+      if (!test || typeof test !== 'object') continue;
+      
+      const status = test.status || "unknown";
+      const error = test.error?.message || test.error || null;
+      const duration = test.duration || 0;
+      
+      s.duration += duration;
+      
+      const testTitle = test.title || `Test@${file}`;
+      
+      if (status === "passed" || status === "expected") {
+        s.passed++;
+        s.passedTests.push({ title: testTitle, file });
+      } else if (status === "failed" || status === "unexpected") {
+        s.failed++;
+        s.failedTests.push({ title: testTitle, file, error: error ? String(error).slice(0, 500) : "No error" });
+      } else if (status === "skipped" || status === "pending") {
+        s.skipped++;
+        s.skippedTests.push({ title: testTitle, file });
+      }
+    }
+    
+    // Walk nested suites
+    for (const child of suite.suites || []) {
+      walk(child, file);
+    }
   }
-  for (const suite of report.suites||[]) walk(suite);
-  s.total    = s.passed+s.failed+s.skipped;
-  s.duration = Math.round(s.duration/1000);
+  
+  // Start walking from root suites
+  for (const suite of report.suites || []) {
+    walk(suite);
+  }
+  
+  // Fallback: if no suites, try direct tests
+  if (!report.suites && report.tests) {
+    for (const test of report.tests) {
+      walk({ tests: [test] });
+    }
+  }
+  
+  s.total = s.passed + s.failed + s.skipped;
+  s.duration = Math.round(s.duration / 1000);
+  
   return s;
 }
 
