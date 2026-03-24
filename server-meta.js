@@ -53,6 +53,50 @@ const TOOL_DEFINITIONS = [
   {
     type: "function",
     function: {
+      name: "list_workflows",
+      description: "List all YML workflow files in .github/workflows directory - FAST LOCAL QUERY",
+      parameters: {
+        type: "object",
+        properties: {
+          repo_id: { type: "number", description: "Repo ID. Default 1." }
+        },
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "find_files",
+      description: "Search local filesystem for files by pattern (e.g., *.yml, *.js, *.test.ts) - FAST LOCAL",
+      parameters: {
+        type: "object",
+        properties: {
+          pattern: { type: "string", description: "File pattern to search for (e.g., '*.yml', '*.test.js')" },
+          repo_id: { type: "number", description: "Repo ID. Default 1." }
+        },
+        required: ["pattern"]
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "search_files",
+      description: "Search file contents for text or regex - FAST LOCAL",
+      parameters: {
+        type: "object",
+        properties: {
+          query: { type: "string", description: "Text or regex pattern to search for" },
+          pattern: { type: "string", description: "File pattern to search in (e.g., '*.js', '*.yml')" },
+          repo_id: { type: "number", description: "Repo ID. Default 1." }
+        },
+        required: ["query"]
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
       name: "run_tests",
       description: "Trigger Playwright tests in GitHub Actions and get results",
       parameters: {
@@ -291,6 +335,79 @@ async function executeTool(name, args, phone) {
   console.log(`🔧 Tool: ${name} | Args: ${JSON.stringify(args)}`);
 
   switch (name) {
+
+    case "list_workflows": {
+      try {
+        const workflows = await ghGet(`/repos/${repo.repo}/contents/.github/workflows`);
+        if (!Array.isArray(workflows)) return "No workflows found.";
+        const ymlFiles = workflows.filter(f => f.name.endsWith('.yml') || f.name.endsWith('.yaml'));
+        return `Found ${ymlFiles.length} YML workflows:\\n${ymlFiles.map(f => `- ${f.name}`).join('\\n')}`;
+      } catch (err) {
+        return `Failed to list workflows: ${err.message}`;
+      }
+    }
+
+    case "find_files": {
+      try {
+        const fs = require('fs');
+        const path = require('path');
+        const repoPath = repo.repo.includes('/') ? process.cwd() : process.cwd();
+        
+        const files = [];
+        function walkDir(dir, pattern) {
+          if (files.length > 50) return;
+          const items = fs.readdirSync(dir, { withFileTypes: true });
+          for (const item of items) {
+            if (files.length > 50) break;
+            const fullPath = path.join(dir, item.name);
+            if (item.isDirectory() && !item.name.startsWith('.')) {
+              walkDir(fullPath, pattern);
+            } else if (item.isFile()) {
+              const regex = new RegExp(pattern.replace(/\*/g, '.*').replace(/\./g, '\\.'));
+              if (regex.test(item.name)) files.push(item.name);
+            }
+          }
+        }
+        walkDir(process.cwd(), args.pattern);
+        return `Found ${files.length} files matching "${args.pattern}": ${files.slice(0,20).join(', ')}${files.length > 20 ? ' ... and more' : ''}`;
+      } catch (err) {
+        return `Failed: ${err.message}`;
+      }
+    }
+
+    case "search_files": {
+      try {
+        const fs = require('fs');
+        const path = require('path');
+        const results = [];
+        
+        function walkDir(dir, pattern, query) {
+          if (results.length > 30) return;
+          const items = fs.readdirSync(dir, { withFileTypes: true });
+          for (const item of items) {
+            if (results.length > 30) break;
+            const fullPath = path.join(dir, item.name);
+            if (item.isDirectory() && !item.name.startsWith('.') && !item.name.includes('node_modules')) {
+              walkDir(fullPath, pattern, query);
+            } else if (item.isFile()) {
+              const regex = new RegExp(pattern.replace(/\*/g, '.*').replace(/\./g, '\\.'));
+              if (regex.test(item.name)) {
+                try {
+                  const content = fs.readFileSync(fullPath, 'utf8');
+                  if (content.includes(query)) {
+                    results.push(`${item.name}: Found "${query}"`);
+                  }
+                } catch (_) {}
+              }
+            }
+          }
+        }
+        walkDir(process.cwd(), args.pattern || '*', args.query);
+        return results.length > 0 ? `Found in ${results.length} files: ${results.join(', ')}` : `Not found in matching files`;
+      } catch (err) {
+        return `Failed: ${err.message}`;
+      }
+    }
 
     case "run_tests": {
       try {
@@ -609,14 +726,17 @@ const pendingFixes = {};
 async function runAgent(phone, userMessage) {
   // Build conversation history
   const history = chatHistory[phone] || [];
+  const toolCallCount = {}; // Track tool calls to prevent infinite loops
 
   const messages = [
     {
       role: "system",
       content:
-`Expert CI/CD engineer. Repos: ${REPOS.map(r => `${r.id}:${r.name}`).join(', ')}
-get_repo_context first. Do ONLY asked. Use tool data. repo_id=1. Rate limit: email cspandey3000@gmail.com
-Tools: get_repo_context,run_tests,create_issues,fix_issue #N,execute_pr #N,merge_pr #N,delete_branch,cleanup_branches,close_issue #N`,
+`Expert CI/CD. Repos: ${REPOS.map(r => `${r.id}:${r.name}`).join(', ')}
+FAST LOCAL TOOLS (use first): list_workflows, find_files, search_files - instant, no API calls
+GITHUB TOOLS (when needed): get_repo_context, run_tests, create_issues, fix_issue, etc
+CONFIRM ACTIONS: Always ask user before create_issues, fix_issue, execute_pr, merge_pr, delete_branch, cleanup_branches, close_issue
+NO LOOPS: Don't call same tool twice. Ask user if ambiguous.`,
     },
     ...history,
     { role: "user", content: userMessage },
@@ -646,6 +766,17 @@ Tools: get_repo_context,run_tests,create_issues,fix_issue #N,execute_pr #N,merge
 
       // Execute each tool Groq requested
       for (const tc of response.tool_calls) {
+        // Prevent infinite loops - don't call same tool twice
+        toolCallCount[tc.function.name] = (toolCallCount[tc.function.name] || 0) + 1;
+        if (toolCallCount[tc.function.name] > 1) {
+          messages.push({
+            role:         "tool",
+            tool_call_id: tc.id,
+            content:      `⚠️ Tool already called. Don't repeat. Ask user instead.`,
+          });
+          continue;
+        }
+
         const args   = JSON.parse(tc.function.arguments || "{}");
         const result = await executeTool(tc.function.name, args, phone);
         console.log(`✅ Tool ${tc.function.name} result: ${String(result).slice(0, 200)}`);
@@ -660,8 +791,7 @@ Tools: get_repo_context,run_tests,create_issues,fix_issue #N,execute_pr #N,merge
     } catch (err) {
       console.error(`❌ Groq error (step ${step}):`, err.response?.data?.error?.message || err.message);
       if (err.response?.status === 429) {
-        await sleep(15000);
-        continue;
+        return "⚠️ Rate limit hit. Please wait 30 mins and try again. Contact: cspandey3000@gmail.com";
       }
       return "⚠️ Something went wrong. Please try again.";
     }
