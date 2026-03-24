@@ -43,7 +43,7 @@ const REPOS = [
 // ─── State ────────────────────────────────────────────────────────
 const chatHistory = {}; // { phone: [{role, content}] }
 const lastReports = {}; // { phone: reportData }
-const MAX_HISTORY = 3;
+const MAX_HISTORY = 10;
 
 // ════════════════════════════════════════════════════════════════════
 //  TOOLS — every action Groq can take
@@ -210,7 +210,7 @@ async function executeTool(name, args, phone) {
             const r = lastReports[phone];
             const s = r?.summary;
             if (!s) return `Run completed but no report found. URL: ${run.html_url}`;
-            return `Tests done: ✅${s.passed} passed, ❌${s.failed} failed, ⊝${s.skipped} skipped, ⏱${s.duration}s. ${s.failedTests?.length ? `Failed: ${s.failedTests.map(t=>t.title).join(', ')}` : 'All passing!'}. Run: ${run.html_url}`;
+            return `✅${s.passed}P ❌${s.failed}F ⊝${s.skipped}S ${run.html_url}`;
           }
           console.log(`⏳ [${Math.round(attempt*30/60)}m] ${run.status}`);
           attempt++;
@@ -223,11 +223,11 @@ async function executeTool(name, args, phone) {
     case "get_repo_context": {
       try {
         const [issuesRes, prsRes, commitsRes, branchesRes, runsRes, repoRes] = await Promise.allSettled([
-          ghGet(`/repos/${repo.repo}/issues?state=open&per_page=8`),
-          ghGet(`/repos/${repo.repo}/pulls?state=open&per_page=4`),
-          ghGet(`/repos/${repo.repo}/commits?per_page=4`),
-          ghGet(`/repos/${repo.repo}/branches?per_page=8`),
-          ghGet(`/repos/${repo.repo}/actions/runs?per_page=2`),
+          ghGet(`/repos/${repo.repo}/issues?state=open&per_page=20`),
+          ghGet(`/repos/${repo.repo}/pulls?state=open&per_page=10`),
+          ghGet(`/repos/${repo.repo}/commits?per_page=10`),
+          ghGet(`/repos/${repo.repo}/branches?per_page=20`),
+          ghGet(`/repos/${repo.repo}/actions/runs?per_page=5`),
           ghGet(`/repos/${repo.repo}`),
         ]);
 
@@ -254,12 +254,13 @@ async function executeTool(name, args, phone) {
         } : null;
 
         return JSON.stringify({
-          repo:       `${repoInfo.full_name}|⭐${repoInfo.stargazers_count}`,
-          issues:     issues.slice(0,4).map(i => `#${i.number}: ${i.title.slice(0,40)}`),
-          prs:        prs.slice(0,3).map(p => `#${p.number}: ${p.title.slice(0,35)}`),
-          commits:    commits.slice(0,3).map(c => `${c.sha?.slice(0,7)}: ${c.commit?.message?.split('\n')[0]?.slice(0,35)}`),
-          branches:   branches.slice(0,4).map(b => b.name),
-          tests:      testDetails || 'Run tests first',
+          repo:        `${repoInfo.full_name} | ⭐${repoInfo.stargazers_count} | ${repoInfo.language} | Branch: ${repoInfo.default_branch}`,
+          openIssues:  issues.map(i => `#${i.number} [${i.labels?.map(l=>l.name).join(',')||'none'}] "${i.title}" @${i.user?.login}`),
+          openPRs:     prs.map(p => `#${p.number} "${p.title}" ${p.head?.ref}→${p.base?.ref}`),
+          recentCommits: commits.slice(0,5).map(c => `${c.sha?.slice(0,7)} ${c.commit?.author?.name}: ${c.commit?.message?.split('\n')[0]}`),
+          branches:    branches.map(b => b.name),
+          workflowRuns: runs.map(w => `${w.conclusion==='success'?'✅':'❌'} "${w.name}" ${w.status}/${w.conclusion||'running'}`),
+          testResults: testDetails || 'No test results loaded yet — run tests first',
         });
       } catch (err) {
         return `Failed to get repo context: ${err.message}`;
@@ -292,11 +293,13 @@ async function executeTool(name, args, phone) {
           if (dup) { skipped.push(`#${dup.number} already exists for "${test.title}"`); continue; }
 
           const body =
-            `## 🐛 Failed Test\n\n` +
+            `## 🐛 Failed Playwright Test\n\n` +
             `**Test:** \`${test.title}\`\n` +
-            `**File:** \`${test.file || "unknown"}\`\n\n` +
-            `\`\`\`\n${(test.error || "No error").slice(0, 200)}\n\`\`\`\n\n` +
-            `Run: ${r.runUrl}`;
+            `**File:** \`${test.file || "unknown"}\`\n` +
+            `**Repo:** \`${repo.repo}\`\n\n` +
+            `## Error\n\`\`\`\n${test.error || "No error"}\n\`\`\`\n\n` +
+            `## Reproduce\n\`\`\`bash\nnpx playwright test --grep "${test.title}"\n\`\`\`\n\n` +
+            `**Run:** ${r.runUrl}\n\n---\n*Auto-created by WhatsApp QA Bot 🤖*`;
 
           const issue = await axios.post(
             `https://api.github.com/repos/${repo.repo}/issues`,
@@ -305,7 +308,7 @@ async function executeTool(name, args, phone) {
           );
           created.push(`#${issue.data.number} "${test.title}" → ${issue.data.html_url}`);
         }
-        return `Created ${created.length} issue(s): ${created.join(', ')}. ${skipped.length ? `Skipped (duplicates): ${skipped.join(', ')}` : ''}`;
+        return `✅ Created ${created.length} issues.`;
       } catch (err) {
         return `Failed to create issues: ${err.message}`;
       }
@@ -330,7 +333,7 @@ async function executeTool(name, args, phone) {
         // Store pending fix context
         pendingFixes[`${phone}_${args.issue_number}`] = { repo, issue, testTitle, testFile, error, runUrl };
 
-        return `AI Fix Agent triggered for issue #${args.issue_number} ("${testTitle}"). GitHub Actions is running the real test to capture DOM and error. PR link will be sent automatically when ready (~3-5 min).`;
+        return `🤖 Fixing #${args.issue_number}. PR ready ~3-5m.`;
       } catch (err) {
         return `Failed to trigger fix for #${args.issue_number}: ${err.message}`;
       }
@@ -371,9 +374,9 @@ async function executeTool(name, args, phone) {
                 { body: `## ✅ Tests Passed\n\nPassed: ${s.passed}, Failed: ${s.failed}\n\n*Verified by WhatsApp QA Bot 🤖*` },
                 { headers: { ...ghHeaders(), "Content-Type": "application/json" } }
               );
-              return `✅ PR #${args.pr_number} tests PASSED (${s.passed} passed). Safe to merge! ${run.html_url}`;
+              return `✅ PR #${args.pr_number} PASSED. Safe to merge. ${run.html_url}`;
             } else {
-              return `❌ PR #${args.pr_number} still failing: ${s?.failedTests?.map(t=>`"${t.title}"`).join(', ')}. ${run.html_url}`;
+              return `❌ PR #${args.pr_number} failed (${s?.failed}). ${run.html_url}`;
             }
           }
           console.log(`⏳ PR run [${Math.round(attempt*30/60)}m]: ${run.status}`);
@@ -407,7 +410,7 @@ async function executeTool(name, args, phone) {
             deleted.push(b.name);
           } catch (_) { failed.push(b.name); }
         }
-        return `Deleted ${deleted.length} ai-fix branches. ${failed.length ? `Failed: ${failed.join(', ')}` : ''}`;
+        return `✅ Deleted ${deleted.length} branches.`;
       } catch (err) {
         return `Failed to cleanup branches: ${err.message}`;
       }
@@ -462,7 +465,10 @@ async function runAgent(phone, userMessage) {
   const messages = [
     {
       role: "system",
-      content: `CI/CD bot. Ask if ambiguous. Use tools only when asked. Answers <2 lines, factual.`,
+      content:
+`Expert CI/CD engineer. Repos: ${REPOS.map(r => `${r.id}:${r.name}`).join(', ')}
+get_repo_context first. Do ONLY asked. Use tool data. repo_id=1. Rate limit: email cspandey3000@gmail.com
+Tools: get_repo_context,run_tests,create_issues,fix_issue #N,execute_pr #N,merge_pr #N,delete_branch,cleanup_branches,close_issue #N`,
     },
     ...history,
     { role: "user", content: userMessage },
@@ -477,8 +483,8 @@ async function runAgent(phone, userMessage) {
         messages,
         tools:       TOOL_DEFINITIONS,
         tool_choice: "auto",
-        temperature: 0.05,
-        max_tokens:  400,
+        temperature: 0.1,
+        max_tokens:  1024,
       }, {
         headers: { Authorization: `Bearer ${GROQ_API_KEY}`, "Content-Type": "application/json" },
       });
@@ -499,7 +505,7 @@ async function runAgent(phone, userMessage) {
         messages.push({
           role:         "tool",
           tool_call_id: tc.id,
-          content:      String(result).slice(0, 1000),
+          content:      String(result),
         });
       }
 
@@ -515,10 +521,13 @@ async function runAgent(phone, userMessage) {
 
   const finalText = response?.content || "Done.";
 
+  // Save to history (keep last 10 exchanges)
   if (!chatHistory[phone]) chatHistory[phone] = [];
-  chatHistory[phone].push({ role: "user", content: userMessage.slice(0, 300) });
-  chatHistory[phone].push({ role: "assistant", content: finalText.slice(0, 300) });
-  if (chatHistory[phone].length > 6) chatHistory[phone] = chatHistory[phone].slice(-6);
+  chatHistory[phone].push({ role: "user", content: userMessage });
+  chatHistory[phone].push({ role: "assistant", content: finalText });
+  if (chatHistory[phone].length > MAX_HISTORY * 2) {
+    chatHistory[phone] = chatHistory[phone].slice(-MAX_HISTORY * 2);
+  }
 
   return finalText;
 }
@@ -566,10 +575,7 @@ app.post("/ai-fix-callback", async (req, res) => {
     }
 
     const prBody =
-      `## 🤖 AI Fix — Issue #${issueNumber}\n\nCloses #${issueNumber}\n\n` +
-      `**Root cause:** ${llmResult.rootCause}\n\n**Fix:** ${llmResult.explanation}\n\n` +
-      `**Files:** ${llmResult.fixes.map(f=>`\`${f.path}\``).join(', ')}\n\n` +
-      `**Run:** ${runUrl}\n\n---\n*Auto-generated by WhatsApp QA Bot 🤖*`;
+      `Closes #${issueNumber}\n\nRoot: ${llmResult.rootCause}\nFix: ${llmResult.explanation}`;
 
     const pr = await axios.post(`https://api.github.com/repos/${repo.repo}/pulls`,
       { title: llmResult.prTitle, body: prBody, head: branchName, base: repo.branch, draft: false },
@@ -582,7 +588,7 @@ app.post("/ai-fix-callback", async (req, res) => {
       { headers }
     );
 
-    await send(phone, `✅ Issue #${issueNumber} fixed!\n🔀 PR #${pr.data.number}: ${pr.data.html_url}\n\nSay "execute PR #${pr.data.number}" to verify.`);
+    await send(phone, `✅ #${issueNumber} fixed! PR #${pr.data.number}\nRun: execute PR #${pr.data.number}`);
 
   } catch (err) {
     console.error("❌ ai-fix-callback:", err.message);
