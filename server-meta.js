@@ -15,13 +15,12 @@ const META_PHONE_ID        = process.env.META_PHONE_ID;
 const META_API_TOKEN       = process.env.META_API_TOKEN;
 const WEBHOOK_VERIFY_TOKEN = process.env.WEBHOOK_VERIFY_TOKEN;
 const GITHUB_TOKEN         = process.env.GITHUB_TOKEN;
-const GROQ_API_KEY         = process.env.GROQ_API_KEY;
+const NVIDIA_API_KEY       = process.env.NVIDIA_API_KEY;
 const BOT_WEBHOOK_URL      = process.env.BOT_WEBHOOK_URL;
 const BOT_WEBHOOK_SECRET   = process.env.BOT_WEBHOOK_SECRET;
 
-const GROQ_URL   = "https://api.groq.com/openai/v1/chat/completions";
-
-const GROQ_MODEL = "openai/gpt-oss-20b";
+const NVIDIA_URL   = "https://integrate.api.nvidia.com/v1/chat/completions";
+const NVIDIA_MODEL = "qwen/qwen3.5-122b-a10b";
 
 // ─── Repo Config ──────────────────────────────────────────────────
 const REPOS = [
@@ -847,18 +846,18 @@ CRITICAL: For every user message, check if you should call a TOOL. Most queries 
   ];
 
   let response;
-  // Agentic loop — Groq can call multiple tools
+  // Agentic loop — NVIDIA can call multiple tools
   for (let step = 0; step < 10; step++) {
     try {
-      const res = await axios.post(GROQ_URL, {
-        model:       GROQ_MODEL,
+      const res = await axios.post(NVIDIA_URL, {
+        model:       NVIDIA_MODEL,
         messages,
         tools:       TOOL_DEFINITIONS,
         tool_choice: "auto",
         temperature: 0.1,
         max_tokens:  1024,
       }, {
-        headers: { Authorization: `Bearer ${GROQ_API_KEY}`, "Content-Type": "application/json" },
+        headers: { Authorization: `Bearer ${NVIDIA_API_KEY}`, "Content-Type": "application/json" },
       });
 
       const choice = res.data.choices[0];
@@ -1004,8 +1003,8 @@ async function generateFix(testTitle, testFile, testResult, artifacts, sourceFil
     `Return JSON: {"prTitle":"fix:...","explanation":"...","rootCause":"...","fixes":[{"path":"...","message":"...","content":"<full file>"}]}`;
 
   try {
-    const res = await axios.post(GROQ_URL, {
-      model:           GROQ_MODEL,
+    const res = await axios.post(NVIDIA_URL, {
+      model:           NVIDIA_MODEL,
       messages:        [
         { role: "system", content: "Expert Playwright engineer. Return ONLY valid JSON. No markdown." },
         { role: "user",   content: prompt }
@@ -1163,12 +1162,12 @@ async function send(toPhone, message) {
   } catch (err) { console.error("❌ WhatsApp send:", err.response?.data||err.message); }
 }
 
-// ─── Groq instant acknowledgment — called before agent runs ──────
-// Uses llama with NO tools, just returns 1 short line
+// ─── NVIDIA instant acknowledgment — called before agent runs ──────
+// Uses qwen with NO tools, just returns 1 short line
 async function getGroqAck(message) {
   try {
-    const res = await axios.post(GROQ_URL, {
-      model:      "llama-3.1-8b-instant", // smallest/fastest model for ack
+    const res = await axios.post(NVIDIA_URL, {
+      model:      NVIDIA_MODEL,
       messages: [
         {
           role: "system",
@@ -1189,11 +1188,11 @@ async function getGroqAck(message) {
       temperature: 0.3,
       max_tokens:  20,
     }, {
-      headers: { Authorization: `Bearer ${GROQ_API_KEY}`, "Content-Type": "application/json" },
+      headers: { Authorization: `Bearer ${NVIDIA_API_KEY}`, "Content-Type": "application/json" },
     });
     return res.data.choices[0].message.content.trim();
   } catch (_) {
-    return "🔍 On it..."; // fallback if Groq fails
+    return "🔍 On it..."; // fallback if NVIDIA fails
   }
 }
 
