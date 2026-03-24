@@ -21,16 +21,7 @@ const BOT_WEBHOOK_SECRET   = process.env.BOT_WEBHOOK_SECRET;
 
 const GROQ_URL   = "https://api.groq.com/openai/v1/chat/completions";
 
-// ─── Available Models ─────────────────────────────────────────────
-const AVAILABLE_MODELS = [
-  { id: 1, name: "groq/compound", label: "Compound (best: 70K tokens/min, unlimited daily)" },
-  { id: 2, name: "llama-3.3-70b-versatile", label: "Llama 3.3 70B (12K tokens/min, 100K daily)" },
-  { id: 3, name: "meta-llama/llama-4-scout-17b-16e-instruct", label: "Llama 4 Scout (30K tokens/min, 500K daily)" },
-  { id: 4, name: "llama-3.1-8b-instant", label: "Llama 3.1 8B (quick: 6K tokens/min, 500K daily)" },
-  { id: 5, name: "openai/gpt-oss-120b", label: "GPT-OSS 120B (code: 8K tokens/min, 200K daily)" },
-  { id: 6, name: "groq/compound-mini", label: "Compound Mini (alt: 70K tokens/min, unlimited daily)" },
-];
-const DEFAULT_MODEL = "groq/compound";
+const GROQ_MODEL = "llama-3.3-70b-versatile";
 
 // ─── Repo Config ──────────────────────────────────────────────────
 const REPOS = [
@@ -54,7 +45,6 @@ const REPOS = [
 
 // ─── State ────────────────────────────────────────────────────────
 const chatHistory = {}; // { phone: [{role, content}] }
-const userModels = {}; // { phone: selectedModel }
 const lastReports = {}; // { phone: reportData }
 const MAX_HISTORY = 10;
 
@@ -814,37 +804,9 @@ async function executeTool(name, args, phone) {
 const pendingFixes = {};
 
 async function runAgent(phone, userMessage) {
-  // Handle model selection
-  const modelMatch = userMessage.match(/^model\s+(\d)/i);
-  if (modelMatch) {
-    const modelId = parseInt(modelMatch[1]);
-    const selected = AVAILABLE_MODELS.find(m => m.id === modelId);
-    if (selected) {
-      userModels[phone] = selected.name;
-      return `✅ Model switched to: ${selected.label}`;
-    } else {
-      let options = "Available models:\n";
-      for (const m of AVAILABLE_MODELS) {
-        options += `${m.id}. ${m.label}\n`;
-      }
-      return `❌ Invalid model. ${options}Use: "model 1" through "model 6"`;
-    }
-  }
-
-  // Show available models
-  if (userMessage.toLowerCase() === "models" || userMessage.toLowerCase() === "list models") {
-    let list = "Available models (use: model 1 through 6):\n";
-    for (const m of AVAILABLE_MODELS) {
-      const marker = userModels[phone] === m.name ? "✓" : " ";
-      list += `${marker} ${m.id}. ${m.label}\n`;
-    }
-    return list;
-  }
-
   // Build conversation history
   const history = chatHistory[phone] || [];
   const toolCallCount = {}; // Track tool calls to prevent infinite loops
-  const selectedModel = userModels[phone] || DEFAULT_MODEL;
 
   const messages = [
     {
@@ -889,7 +851,7 @@ CRITICAL: For every user message, check if you should call a TOOL. Most queries 
   for (let step = 0; step < 10; step++) {
     try {
       const res = await axios.post(GROQ_URL, {
-        model:       selectedModel,
+        model:       GROQ_MODEL,
         messages,
         tools:       TOOL_DEFINITIONS,
         tool_choice: "auto",
@@ -1043,7 +1005,7 @@ async function generateFix(testTitle, testFile, testResult, artifacts, sourceFil
 
   try {
     const res = await axios.post(GROQ_URL, {
-      model:           DEFAULT_MODEL,
+      model:           GROQ_MODEL,
       messages:        [
         { role: "system", content: "Expert Playwright engineer. Return ONLY valid JSON. No markdown." },
         { role: "user",   content: prompt }
