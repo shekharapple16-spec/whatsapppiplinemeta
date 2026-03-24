@@ -13,12 +13,12 @@ const META_PHONE_ID        = process.env.META_PHONE_ID;
 const META_API_TOKEN       = process.env.META_API_TOKEN;
 const WEBHOOK_VERIFY_TOKEN = process.env.WEBHOOK_VERIFY_TOKEN;
 const GITHUB_TOKEN         = process.env.GITHUB_TOKEN;
-const NVIDIA_API_KEY       = process.env.NVIDIA_API_KEY;
+const GROQ_API_KEY         = process.env.GROQ_API_KEY;
 const BOT_WEBHOOK_URL      = process.env.BOT_WEBHOOK_URL;
 const BOT_WEBHOOK_SECRET   = process.env.BOT_WEBHOOK_SECRET;
 
-const NVIDIA_URL   = "https://integrate.api.nvidia.com/v1/chat/completions";
-const NVIDIA_MODEL = "qwen/qwen3.5-122b-a10b";
+const GROQ_URL   = "https://api.groq.com/openai/v1/chat/completions";
+const GROQ_MODEL = "openai/gpt-oss-120b";
 
 // ─── Repo Config ──────────────────────────────────────────────────
 const REPOS = [
@@ -30,15 +30,20 @@ const REPOS = [
     aiFixWorkflow: "ai-fix.yml",
     branch: "master",
   },
- 
+  {
+    id: 2, name: "Repo Two",
+    keywords: ["repo2", "two", "2"],
+    repo: "your-username/your-repo-2",
+    workflow: "playwright.yml",
+    aiFixWorkflow: "ai-fix.yml",
+    branch: "main",
+  },
 ];
 
 // ─── State ────────────────────────────────────────────────────────
 const chatHistory = {}; // { phone: [{role, content}] }
 const lastReports = {}; // { phone: reportData }
-const processedMessages = new Set(); // { messageId } - prevent duplicate processing
 const MAX_HISTORY = 10;
-const MESSAGE_DEDUP_TTL = 60000; // Clear duplicates after 1 minute
 
 // ════════════════════════════════════════════════════════════════════
 //  TOOLS — every action Groq can take
@@ -79,9 +84,8 @@ const TOOL_DEFINITIONS = [
       parameters: {
         type: "object",
         properties: {
-          repo_id: { type: "integer", description: "Repo ID (1 for HCL Playwright). Default 1." }
+          repo_id: { type: "number", description: "Repo ID. Default 1." }
         },
-        required: []
       }
     }
   },
@@ -181,16 +185,8 @@ const TOOL_DEFINITIONS = [
 // ════════════════════════════════════════════════════════════════════
 
 async function executeTool(name, args, phone) {
-  // Parse and validate repo_id early
-  const repoId = parseInt(args.repo_id) || 1;
-  const repo = REPOS.find(r => r.id === repoId) || REPOS[0];
-  
-  // Parse numeric args safely
-  const issueNumber = args.issue_number ? parseInt(args.issue_number) : null;
-  const prNumber = args.pr_number ? parseInt(args.pr_number) : null;
-  const branchName = args.branch_name ? String(args.branch_name).trim() : null;
-  
-  console.log(`🔧 Tool: ${name} | Args: ${JSON.stringify({...args, repo_id: repoId, issue_number: issueNumber, pr_number: prNumber})}`);
+  const repo = REPOS.find(r => r.id === (args.repo_id || 1)) || REPOS[0];
+  console.log(`🔧 Tool: ${name} | Args: ${JSON.stringify(args)}`);
 
   switch (name) {
 
@@ -204,28 +200,23 @@ async function executeTool(name, args, phone) {
         // Poll for completion
         await sleep(12000);
         const runsRes      = await ghGet(`/repos/${repo.repo}/actions/runs?per_page=1`);
-        const trackedRunId = runsRes.workflow_runs?.[0]?.id;
-        if (!trackedRunId) return `❌ Failed to get workflow run ID`;
-        
+        const trackedRunId = runsRes.workflow_runs[0]?.id;
         let attempt = 0;
-        while (attempt < 30) {
+        while (true) {
           await sleep(30000);
           const run = await ghGet(`/repos/${repo.repo}/actions/runs/${trackedRunId}`);
           if (run.status === "completed") {
             await loadReport(phone, repo, trackedRunId, run);
             const r = lastReports[phone];
             const s = r?.summary;
-            if (!s) return `Run completed. Check: ${run.html_url}`;
-            const failedList = s.failedTests?.length ? `Failed: ${s.failedTests.map(t=>t.title).join(', ')}` : 'All passing!';
-            const suggestion = s.failed > 0 ? `\n💡 Say "create issue" to log failures` : '';
-            return `Tests: ✅${s.passed}p ❌${s.failed}f ⊝${s.skipped}s ⏱${s.duration}s\n${failedList}${suggestion}\n${run.html_url}`;
+            if (!s) return `Run completed but no report found. URL: ${run.html_url}`;
+            return `Tests done: ✅${s.passed} passed, ❌${s.failed} failed, ⊝${s.skipped} skipped, ⏱${s.duration}s. ${s.failedTests?.length ? `Failed: ${s.failedTests.map(t=>t.title).join(', ')}` : 'All passing!'}. Run: ${run.html_url}`;
           }
           console.log(`⏳ [${Math.round(attempt*30/60)}m] ${run.status}`);
           attempt++;
         }
-        return `❌ Tests timeout (30min+)`;
       } catch (err) {
-        return `❌ Failed to run tests: ${err.message}`;
+        return `Failed to run tests: ${err.message}`;
       }
     }
 
@@ -244,7 +235,7 @@ async function executeTool(name, args, phone) {
         const prs      = prsRes.status      === "fulfilled" ? prsRes.value      : [];
         const commits  = commitsRes.status  === "fulfilled" ? commitsRes.value  : [];
         const branches = branchesRes.status === "fulfilled" ? branchesRes.value : [];
-        const runs     = runsRes.status     === "fulfilled" ? runsRes.value?.workflow_runs||[] : [];
+        const runs     = runsRes.status     === "fulfilled" ? runsRes.value.workflow_runs : [];
         const repoInfo = repoRes.status     === "fulfilled" ? repoRes.value     : {};
 
         // Always include full test details from lastReports
@@ -263,36 +254,32 @@ async function executeTool(name, args, phone) {
         } : null;
 
         return JSON.stringify({
-          repo:        `${repoInfo.full_name} | ⭐${repoInfo.stargazers_count||0} | ${repoInfo.language||'unknown'} | Branch: ${repoInfo.default_branch||repo.branch}`,
-          openIssues:  issues.slice(0,10).map(i => `#${i.number} [${i.labels?.map(l=>l.name).join(',')||'none'}] "${i.title}"`),
-          openPRs:     prs.slice(0,10).map(p => `#${p.number} "${p.title}" ${p.head?.ref||'?'}→${p.base?.ref||repo.branch}`),
-          recentCommits: commits.slice(0,5).map(c => `${c.sha?.slice(0,7)} ${c.commit?.author?.name||'?'}: ${c.commit?.message?.split('\n')[0]}`),
-          branches:    branches.slice(0,15).map(b => b.name),
-          workflowRuns: runs.slice(0,5).map(w => `${w.conclusion==='success'?'✅':'❌'} ${w.name} (${w.status}/${w.conclusion||'running'})`),
-          testResults: testDetails || 'No test results — run tests first',
+          repo:        `${repoInfo.full_name} | ⭐${repoInfo.stargazers_count} | ${repoInfo.language} | Branch: ${repoInfo.default_branch}`,
+          openIssues:  issues.map(i => `#${i.number} [${i.labels?.map(l=>l.name).join(',')||'none'}] "${i.title}" @${i.user?.login}`),
+          openPRs:     prs.map(p => `#${p.number} "${p.title}" ${p.head?.ref}→${p.base?.ref}`),
+          recentCommits: commits.slice(0,5).map(c => `${c.sha?.slice(0,7)} ${c.commit?.author?.name}: ${c.commit?.message?.split('\n')[0]}`),
+          branches:    branches.map(b => b.name),
+          workflowRuns: runs.map(w => `${w.conclusion==='success'?'✅':'❌'} "${w.name}" ${w.status}/${w.conclusion||'running'}`),
+          testResults: testDetails || 'No test results loaded yet — run tests first',
         });
       } catch (err) {
-        return `❌ Failed to get repo context: ${err.message}`;
+        return `Failed to get repo context: ${err.message}`;
       }
     }
 
     case "create_issues": {
       try {
-        let report = lastReports[phone];
-        if (!report?.summary?.failedTests?.length) {
+        const report = lastReports[phone];
+        if (!report?.summary) {
           // Try to load latest report
           const runsRes = await ghGet(`/repos/${repo.repo}/actions/runs?per_page=10&status=completed`);
-          for (const run of runsRes.workflow_runs||[]) {
+          for (const run of runsRes.workflow_runs) {
             await loadReport(phone, repo, run.id, run);
-            if (lastReports[phone]?.summary?.failedTests?.length) {
-              report = lastReports[phone];
-              break;
-            }
+            if (lastReports[phone]?.summary) break;
           }
         }
-        
-        const r = report || lastReports[phone];
-        if (!r?.summary?.failedTests?.length) return `❌ No failed tests found.`;
+        const r = lastReports[phone];
+        if (!r?.summary?.failedTests?.length) return "No failed tests found. Nothing to create issues for.";
 
         // Check existing issues to avoid duplicates
         const existing = await ghGet(`/repos/${repo.repo}/issues?state=open&per_page=100`);
@@ -301,64 +288,61 @@ async function executeTool(name, args, phone) {
         for (const test of r.summary.failedTests) {
           const dup = existing.find(i => {
             const t = i.title.toLowerCase().replace("🐛 [playwright] ", "").trim();
-            return t.includes(test.title.toLowerCase().trim());
+            return t === test.title.toLowerCase().trim() || t.includes(test.title.toLowerCase().trim());
           });
-          if (dup) { skipped.push(`#${dup.number}`); continue; }
+          if (dup) { skipped.push(`#${dup.number} already exists for "${test.title}"`); continue; }
 
           const body =
             `## 🐛 Failed Playwright Test\n\n` +
             `**Test:** \`${test.title}\`\n` +
-            `**File:** \`${test.file || "unknown"}\`\n\n` +
-            `## Error\n\`\`\`\n${(test.error||"No error").slice(0,500)}\n\`\`\`\n\n` +
-            `**Run:** ${r.runUrl}\n\n*Auto-created by QA Bot*`;
+            `**File:** \`${test.file || "unknown"}\`\n` +
+            `**Repo:** \`${repo.repo}\`\n\n` +
+            `## Error\n\`\`\`\n${test.error || "No error"}\n\`\`\`\n\n` +
+            `## Reproduce\n\`\`\`bash\nnpx playwright test --grep "${test.title}"\n\`\`\`\n\n` +
+            `**Run:** ${r.runUrl}\n\n---\n*Auto-created by WhatsApp QA Bot 🤖*`;
 
           const issue = await axios.post(
             `https://api.github.com/repos/${repo.repo}/issues`,
-            { title: `🐛 [Playwright] ${test.title}`, body, labels: ["bug", "playwright"] },
+            { title: `🐛 [Playwright] ${test.title}`, body, labels: ["bug", "playwright", "automated"] },
             { headers: { ...ghHeaders(), "Content-Type": "application/json" } }
           );
-          created.push(`#${issue.data.number}`);
+          created.push(`#${issue.data.number} "${test.title}" → ${issue.data.html_url}`);
         }
-        return `✅ Created ${created.length} issue(s): ${created.join(', ')}${skipped.length ? ` (Skipped duplicates: ${skipped.join(',')})` : ''}`;
+        return `Created ${created.length} issue(s): ${created.join(', ')}. ${skipped.length ? `Skipped (duplicates): ${skipped.join(', ')}` : ''}`;
       } catch (err) {
-        return `❌ Failed to create issues: ${err.message}`;
+        return `Failed to create issues: ${err.message}`;
       }
     }
 
     case "fix_issue": {
-      if (!issueNumber) return `❌ Issue number missing. Usage: fix issue #123`;
       try {
-        const issue = await ghGet(`/repos/${repo.repo}/issues/${issueNumber}`);
-        if (!issue) return `❌ Issue #${issueNumber} not found`;
-        
+        const issue = await ghGet(`/repos/${repo.repo}/issues/${args.issue_number}`);
         const testTitle = issue.title.replace("🐛 [Playwright] ", "").trim();
         const testFile  = extractField(issue.body, "File") || "tests/";
         const error     = extractError(issue.body);
         const runUrl    = extractRunUrl(issue.body) || `https://github.com/${repo.repo}/actions`;
 
-        console.log(`🔧 Fixing #${issueNumber}: "${testTitle}"`);
+        console.log(`🔧 Fixing #${args.issue_number}: "${testTitle}" file: ${testFile}`);
 
         await axios.post(
           `https://api.github.com/repos/${repo.repo}/actions/workflows/${repo.aiFixWorkflow}/dispatches`,
-          { ref: repo.branch, inputs: { test_file: testFile, test_title: testTitle, issue_number: String(issueNumber), phone_number: phone } },
+          { ref: repo.branch, inputs: { test_file: testFile, test_title: testTitle, issue_number: String(args.issue_number), phone_number: phone } },
           { headers: ghHeaders() }
         );
 
-        pendingFixes[`${phone}_${issueNumber}`] = { repo, issue, testTitle, testFile, error, runUrl };
-        return `✅ AI Fix triggered for #${issueNumber}. PR coming in ~3-5 min. Say "status" to check.`;
+        // Store pending fix context
+        pendingFixes[`${phone}_${args.issue_number}`] = { repo, issue, testTitle, testFile, error, runUrl };
+
+        return `AI Fix Agent triggered for issue #${args.issue_number} ("${testTitle}"). GitHub Actions is running the real test to capture DOM and error. PR link will be sent automatically when ready (~3-5 min).`;
       } catch (err) {
-        return `❌ Failed to fix #${issueNumber}: ${err.message}`;
+        return `Failed to trigger fix for #${args.issue_number}: ${err.message}`;
       }
     }
 
     case "execute_pr": {
-      if (!prNumber) return `❌ PR number missing. Usage: execute PR #123`;
       try {
-        const pr = await ghGet(`/repos/${repo.repo}/pulls/${prNumber}`);
-        if (!pr) return `❌ PR #${prNumber} not found`;
-        
-        const prBranch = pr.head?.ref;
-        if (!prBranch) return `❌ Could not get PR branch`;
+        const pr = await ghGet(`/repos/${repo.repo}/pulls/${args.pr_number}`);
+        const prBranch = pr.head.ref;
 
         try {
           await axios.post(
@@ -376,45 +360,42 @@ async function executeTool(name, args, phone) {
 
         await sleep(12000);
         const runsRes      = await ghGet(`/repos/${repo.repo}/actions/runs?per_page=1`);
-        const trackedRunId = runsRes.workflow_runs?.[0]?.id;
-        if (!trackedRunId) return `❌ Failed to start tests on PR`;
-        
+        const trackedRunId = runsRes.workflow_runs[0]?.id;
         let attempt = 0;
-        while (attempt < 30) {
+        while (true) {
           await sleep(30000);
           const run = await ghGet(`/repos/${repo.repo}/actions/runs/${trackedRunId}`);
           if (run.status === "completed") {
             await loadReport(phone, repo, trackedRunId, run);
             const s = lastReports[phone]?.summary;
             if (s?.failed === 0) {
-              await axios.post(`https://api.github.com/repos/${repo.repo}/issues/${prNumber}/comments`,
-                { body: `✅ Tests passed (${s.passed}p) Ready to merge!` },
+              // Auto comment on PR
+              await axios.post(`https://api.github.com/repos/${repo.repo}/issues/${args.pr_number}/comments`,
+                { body: `## ✅ Tests Passed\n\nPassed: ${s.passed}, Failed: ${s.failed}\n\n*Verified by WhatsApp QA Bot 🤖*` },
                 { headers: { ...ghHeaders(), "Content-Type": "application/json" } }
               );
-              return `✅ PR #${prNumber} PASSED! ${s.passed}p ❌${s.failed}f. Safe to merge.`;
+              return `✅ PR #${args.pr_number} tests PASSED (${s.passed} passed). Safe to merge! ${run.html_url}`;
             } else {
-              return `❌ PR #${prNumber} failed: ${s?.failedTests?.map(t=>`"${t.title}"`).join(', ')}`;
+              return `❌ PR #${args.pr_number} still failing: ${s?.failedTests?.map(t=>`"${t.title}"`).join(', ')}. ${run.html_url}`;
             }
           }
-          console.log(`⏳ PR #${prNumber} [${Math.round(attempt*30/60)}m]`);
+          console.log(`⏳ PR run [${Math.round(attempt*30/60)}m]: ${run.status}`);
           attempt++;
         }
-        return `❌ PR test timeout`;
       } catch (err) {
-        return `❌ Failed to execute PR: ${err.message}`;
+        return `Failed to execute PR: ${err.message}`;
       }
     }
 
     case "delete_branch": {
-      if (!branchName) return `❌ Branch name missing. Usage: delete branch feature-x`;
       try {
         await axios.delete(
-          `https://api.github.com/repos/${repo.repo}/git/refs/heads/${branchName}`,
+          `https://api.github.com/repos/${repo.repo}/git/refs/heads/${args.branch_name}`,
           { headers: ghHeaders() }
         );
-        return `✅ Branch "${branchName}" deleted`;
+        return `Branch "${args.branch_name}" deleted successfully.`;
       } catch (err) {
-        return `❌ Failed to delete "${branchName}": ${err.response?.data?.message || err.message}`;
+        return `Failed to delete branch "${args.branch_name}": ${err.response?.data?.message || err.message}`;
       }
     }
 
@@ -422,60 +403,52 @@ async function executeTool(name, args, phone) {
       try {
         const branches = await ghGet(`/repos/${repo.repo}/branches?per_page=100`);
         const aiFixBranches = branches.filter(b => b.name.startsWith('ai-fix-'));
-        if (!aiFixBranches.length) return `✅ No ai-fix branches to clean`;
-        
-        const deleted = [];
+        const deleted = [], failed = [];
         for (const b of aiFixBranches) {
           try {
             await axios.delete(`https://api.github.com/repos/${repo.repo}/git/refs/heads/${b.name}`, { headers: ghHeaders() });
             deleted.push(b.name);
-          } catch (_) {}
+          } catch (_) { failed.push(b.name); }
         }
-        return `✅ Cleaned ${deleted.length}/${aiFixBranches.length} ai-fix branches`;
+        return `Deleted ${deleted.length} ai-fix branches. ${failed.length ? `Failed: ${failed.join(', ')}` : ''}`;
       } catch (err) {
-        return `❌ Failed to cleanup branches: ${err.message}`;
+        return `Failed to cleanup branches: ${err.message}`;
       }
     }
 
     case "merge_pr": {
-      if (!prNumber) return `❌ PR number missing. Usage: merge PR #123`;
       try {
-        const pr = await ghGet(`/repos/${repo.repo}/pulls/${prNumber}`);
-        if (!pr) return `❌ PR #${prNumber} not found`;
-        if (pr.merged) return `✅ PR #${prNumber} already merged`;
-        
         const res = await axios.put(
-          `https://api.github.com/repos/${repo.repo}/pulls/${prNumber}/merge`,
+          `https://api.github.com/repos/${repo.repo}/pulls/${args.pr_number}/merge`,
           { merge_method: "squash" },
           { headers: { ...ghHeaders(), "Content-Type": "application/json" } }
         );
-        return `✅ PR #${prNumber} merged successfully`;
+        return `PR #${args.pr_number} merged successfully. SHA: ${res.data.sha?.slice(0,7)}`;
       } catch (err) {
-        return `❌ Failed to merge PR #${prNumber}: ${err.response?.data?.message || err.message}`;
+        return `Failed to merge PR #${args.pr_number}: ${err.response?.data?.message || err.message}`;
       }
     }
 
     case "close_issue": {
-      if (!issueNumber) return `❌ Issue number missing. Usage: close issue #123`;
       try {
         if (args.comment) {
-          await axios.post(`https://api.github.com/repos/${repo.repo}/issues/${issueNumber}/comments`,
+          await axios.post(`https://api.github.com/repos/${repo.repo}/issues/${args.issue_number}/comments`,
             { body: args.comment },
             { headers: { ...ghHeaders(), "Content-Type": "application/json" } }
           );
         }
-        await axios.patch(`https://api.github.com/repos/${repo.repo}/issues/${issueNumber}`,
+        await axios.patch(`https://api.github.com/repos/${repo.repo}/issues/${args.issue_number}`,
           { state: "closed" },
           { headers: { ...ghHeaders(), "Content-Type": "application/json" } }
         );
-        return `✅ Issue #${issueNumber} closed`;
+        return `Issue #${args.issue_number} closed.`;
       } catch (err) {
-        return `❌ Failed to close issue #${issueNumber}: ${err.message}`;
+        return `Failed to close issue #${args.issue_number}: ${err.message}`;
       }
     }
 
     default:
-      return `❌ Unknown tool: ${name}`;
+      return `Unknown tool: ${name}`;
   }
 }
 
@@ -493,37 +466,65 @@ async function runAgent(phone, userMessage) {
     {
       role: "system",
       content:
-`You are a CI/CD bot. Simple workflow:
-1. User says "run tests" → Call run_tests → Share test results (passed/failed/skipped counts)
-2. User says "create issue" → Call create_issues → Share issue numbers created
-3. User says "fix issue #N" → Call fix_issue with issue number → Share PR number created
-4. User says "execute PR #N" → Call execute_pr with PR number → Run tests on PR, share pass/fail
-5. User says "merge PR #N" → Call merge_pr with PR number → Merge it, share status
+`You are an expert CI/CD and DevOps engineer with full access to GitHub repositories via tools.
 
-Simple rules:
-- Default repo_id = 1 (HCL Playwright)
-- Be direct, max 2 lines response
-- When user says "fix it" without a number, ask "Which issue number?"
-- When user says "execute PR" without a number, ask "Which PR number?"
-- Create issues only from failed tests in the last test run`,
+EXPERTISE:
+- Playwright test automation, GitHub Actions, CI/CD pipelines
+- Code quality, branch management, PR reviews, issue tracking
+- Any repo question: commits, branches, contributors, workflows, deployments
+- Test results analysis, failure diagnosis, fix recommendations
+
+AVAILABLE REPOS: ${REPOS.map(r => `${r.id}. ${r.name} (${r.repo})`).join(', ')}
+
+BEHAVIOUR:
+- Always call get_repo_context before answering any question about the repo — data must be live, never guessed
+- Do ONLY what user explicitly asks. NEVER take extra actions
+- Answers: max 2 lines, factual, direct. Use real numbers and names from tool data
+- For lists (test names, issues, PRs): show them clearly, one per line
+- Test names ARE in testResults.passedTests/failedTests/skippedTests — always use them
+- Never say "data unavailable" if tool returned it
+- repo_id defaults to 1 unless user specifies
+- if in any case rate limits are hit, respond with "retry after 15s or contact support admin team - cspandey3000@gmail.com"
+- if user ask some details about test failures, always refer to testResults.failedTests for real test names and errors, never guess
+
+CLARIFICATION RULES (important):
+- If the request is ambiguous or missing required info, ask ONE short clarifying question — do NOT call any tool yet
+- Examples of when to ask:
+  * "fix the issue" (no number) → ask "Which issue number? e.g. fix #160"
+  * "delete branch" (no name) → ask "Which branch name?"
+  * "run tests on branch" (no branch) → ask "Which branch?"
+  * "create a PR" (no context) → ask "PR for which branch/fix?"
+- If request is clear → act immediately, no need to ask
+- Never ask more than one question at a time
+
+TOOL USAGE (only when user clearly asks):
+- get_repo_context → any question about repo state, issues, PRs, commits, branches, test results
+- run_tests → only when user says run/trigger/execute tests
+- create_issues → only when user says create/log/raise issues
+- fix_issue → only when user says fix issue #N (needs a number)
+- execute_pr → only when user says execute/run/verify PR #N (needs a number)
+- merge_pr → only when user says merge PR #N (needs a number)
+- delete_branch → only when user says delete branch (needs a name)
+- cleanup_branches → only when user says cleanup/delete all ai-fix branches
+- close_issue → only when user says close issue #N (needs a number)`,
     },
     ...history,
     { role: "user", content: userMessage },
   ];
 
   let response;
-  // Agentic loop — NVIDIA can call multiple tools
+  // Agentic loop — Groq can call multiple tools
   for (let step = 0; step < 10; step++) {
     try {
-      const res = await axios.post(NVIDIA_URL, {
-        model:       NVIDIA_MODEL,
+      const res = await axios.post(GROQ_URL, {
+        model:       GROQ_MODEL,
         messages,
         tools:       TOOL_DEFINITIONS,
         tool_choice: "auto",
         temperature: 0.1,
         max_tokens:  1024,
       }, {
-        headers: { Authorization: `Bearer ${NVIDIA_API_KEY}`, "Accept": "application/json" },
+        headers: { Authorization: `Bearer ${GROQ_API_KEY}`, "Content-Type": "application/json" },
       });
 
       const choice = res.data.choices[0];
@@ -637,130 +638,44 @@ app.post("/ai-fix-callback", async (req, res) => {
 
 // ─── Groq fix generation ──────────────────────────────────────────
 async function generateFix(testTitle, testFile, testResult, artifacts, sourceFiles, runUrl) {
+  const error        = testResult?.error || testResult?.failedTests?.[0]?.error || "No error";
+  const testContent  = sourceFiles?.[testFile] || sourceFiles?.[Object.keys(sourceFiles||{}).find(p=>p.includes(path.basename(testFile||'')))] || "";
+  const domSnapshot  = artifacts?.domSnapshot || "";
+
+  // Extract only relevant DOM
+  const selectors = [...(testContent.matchAll(/(?:locator|fill|click|waitFor\w*)\s*\(\s*['"`]([^'"`\n]{2,60})['"`]/g))].map(m=>m[1]).slice(0,10);
+  const relevantDom = selectors.length > 0
+    ? (domSnapshot.match(/<[^>]+>[^<]*/g)||[]).filter(t=>selectors.some(s=>t.includes(s.replace(/^[#.]/,'')))).slice(0,15).join('\n').slice(0,1500)
+    : domSnapshot.slice(0,1000);
+
+  const pageObj = Object.entries(sourceFiles||{}).find(([p])=>p.includes('pages/')||p.toLowerCase().includes('page'));
+
+  const prompt =
+    `Fix this Playwright test. Minimal change only.\n\n` +
+    `ERROR: ${error.slice(0,400)}\n\n` +
+    `TEST (${testFile}):\n\`\`\`js\n${testContent.slice(0,2500)}\n\`\`\`\n\n` +
+    `${pageObj ? `PAGE OBJECT (${pageObj[0]}):\n\`\`\`js\n${pageObj[1].slice(0,1500)}\n\`\`\`` : ''}\n\n` +
+    `${relevantDom ? `RELEVANT DOM:\n\`\`\`html\n${relevantDom}\n\`\`\`` : ''}\n\n` +
+    `VALID PATHS: ${Object.keys(sourceFiles||{}).map(p=>`\`${p}\``).join(', ') || `\`${testFile}\``}\n\n` +
+    `Return JSON: {"prTitle":"fix:...","explanation":"...","rootCause":"...","fixes":[{"path":"...","message":"...","content":"<full file>"}]}`;
+
   try {
-    const error = testResult?.error || testResult?.failedTests?.[0]?.error || "No error";
-    
-    if (!testFile || !sourceFiles || Object.keys(sourceFiles).length === 0) {
-      console.log("❌ generateFix: Missing testFile or sourceFiles");
-      return null;
-    }
+    const res = await axios.post(GROQ_URL, {
+      model:           GROQ_MODEL,
+      messages:        [
+        { role: "system", content: "Expert Playwright engineer. Return ONLY valid JSON. No markdown." },
+        { role: "user",   content: prompt }
+      ],
+      response_format: { type: "json_object" },
+      temperature:     0.1,
+      max_tokens:      4096,
+    }, { headers: { Authorization: `Bearer ${GROQ_API_KEY}`, "Content-Type": "application/json" } });
 
-    // Find test content
-    const testContent = sourceFiles?.[testFile] || 
-      sourceFiles?.[Object.keys(sourceFiles||{}).find(p => p.includes(path.basename(testFile||'')))] || 
-      "";
-    
-    if (!testContent) {
-      console.log(`⚠️ Could not find test file: ${testFile}`);
-      return null;
-    }
-
-    const domSnapshot = artifacts?.domSnapshot || "";
-
-    // Extract relevant selectors from test code
-    const selectors = [...(testContent.matchAll(/(?:locator|fill|click|waitFor\w*)\s*\(\s*['"`]([^'"`\n]{2,60})['"`]/g))]
-      .map(m => m[1])
-      .slice(0, 10);
-
-    // Extract relevant DOM elements
-    const relevantDom = selectors.length > 0
-      ? (domSnapshot.match(/<[^>]+>[^<]*/g) || [])
-          .filter(t => selectors.some(s => t.includes(s.replace(/^[#.]/, ""))))
-          .slice(0, 15)
-          .join("\n")
-          .slice(0, 1500)
-      : domSnapshot.slice(0, 1000);
-
-    // Find page object file
-    const pageObj = Object.entries(sourceFiles || {}).find(([p]) => p.includes("pages/") || p.toLowerCase().includes("page"));
-
-    const prompt =
-      `Fix this Playwright test. Minimal change only.\n\n` +
-      `ERROR: ${String(error).slice(0, 400)}\n\n` +
-      `TEST (${testFile}):\n\`\`\`js\n${testContent.slice(0, 2500)}\n\`\`\`\n\n` +
-      `${pageObj ? `PAGE OBJECT (${pageObj[0]}):\n\`\`\`js\n${pageObj[1].slice(0, 1500)}\n\`\`\`` : ""}\n\n` +
-      `${relevantDom ? `RELEVANT DOM:\n\`\`\`html\n${relevantDom}\n\`\`\`` : ""}\n\n` +
-      `VALID PATHS: ${Object.keys(sourceFiles || {}).map(p => `\`${p}\``).join(", ") || `\`${testFile}\``}\n\n` +
-      `RULES: Return ONLY valid JSON (no markdown). Include prTitle, explanation, rootCause, fixes array.\n` +
-      `fixes[].path MUST be from VALID PATHS list. fixes[].content must be complete file.`;
-
-    console.log(`🧠 Calling NVIDIA for fix: "${testTitle}" in ${testFile}`);
-
-    const res = await axios.post(
-      NVIDIA_URL,
-      {
-        model: NVIDIA_MODEL,
-        messages: [
-          { role: "system", content: "You are an expert Playwright engineer. Return ONLY valid JSON. Do not use markdown code blocks." },
-          { role: "user", content: prompt },
-        ],
-        temperature: 0.1,
-        max_tokens: 4096,
-      },
-      { headers: { Authorization: `Bearer ${NVIDIA_API_KEY}`, "Accept": "application/json" } }
-    );
-
-    if (!res.data?.choices?.[0]?.message?.content) {
-      console.log("❌ generateFix: Empty response from NVIDIA");
-      return null;
-    }
-
-    let content = res.data.choices[0].message.content.trim();
-    
-    // Extract JSON if wrapped in markdown code blocks
-    const jsonMatch = content.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
-    if (jsonMatch) {
-      content = jsonMatch[1].trim();
-    }
-
-    let result;
-    try {
-      result = JSON.parse(content);
-    } catch (parseErr) {
-      console.log(`❌ JSON parse error: ${parseErr.message}`);
-      console.log(`Response (first 300 chars): ${content.slice(0, 300)}`);
-      return null;
-    }
-
-    // Validate result
-    if (!result || typeof result !== "object") {
-      console.log("❌ Result is not an object");
-      return null;
-    }
-
-    if (!result.prTitle || !result.explanation || !result.rootCause) {
-      console.log("❌ Missing required fields: prTitle, explanation, or rootCause");
-      return null;
-    }
-
-    if (!Array.isArray(result.fixes) || result.fixes.length === 0) {
-      console.log("❌ fixes is not an array or is empty");
-      return null;
-    }
-
-    // Validate and correct file paths
-    const validPaths = Object.keys(sourceFiles || {});
-    for (const fix of result.fixes) {
-      if (!fix.path || !fix.message || !fix.content) {
-        console.log(`⚠️ Invalid fix: missing path, message, or content`);
-        continue;
-      }
-
-      if (!validPaths.includes(fix.path)) {
-        const corrected = validPaths.find(p => p.includes(fix.path) || fix.path.includes(p));
-        if (corrected) {
-          console.log(`🔧 Path auto-corrected: ${fix.path} → ${corrected}`);
-          fix.path = corrected;
-        } else {
-          console.log(`⚠️ Path "${fix.path}" not found in source files. Will attempt to create/update.`);
-        }
-      }
-    }
-
-    console.log(`✅ Fix ready: "${result.prTitle}" | Files: ${result.fixes.map(f => f.path).join(", ")}`);
+    const result = JSON.parse(res.data.choices[0].message.content);
+    console.log(`🧠 Fix: "${result.prTitle}" | ${result.fixes?.length} file(s) | paths: ${result.fixes?.map(f=>f.path).join(',')}`);
     return result;
   } catch (err) {
-    console.error(`❌ generateFix exception: ${err.message}`);
+    console.error("❌ generateFix:", err.message);
     return null;
   }
 }
@@ -779,32 +694,17 @@ app.post("/webhook", async (req, res) => {
   try {
     const body = req.body;
     if (body.object && body.entry?.[0]?.changes?.[0]?.value?.messages) {
-      const messageEntry = body.entry[0].changes[0].value.messages[0];
-      const messageId = messageEntry.id; // Unique message ID from Meta
-      
-      // Deduplication: Skip if we've already processed this message
-      if (processedMessages.has(messageId)) {
-        console.log(`⏭️ Skipping duplicate message: ${messageId}`);
-        return res.sendStatus(200);
-      }
-      
-      // Mark as processed
-      processedMessages.add(messageId);
-      setTimeout(() => processedMessages.delete(messageId), MESSAGE_DEDUP_TTL);
-      
-      const fromPhone = messageEntry.from;
-      const messageBody = messageEntry.text?.body;
+      const fromPhone   = body.entry[0].changes[0].value.messages[0].from;
+      const messageBody = body.entry[0].changes[0].value.messages[0].text?.body;
       if (!messageBody) return res.sendStatus(200);
-      
       console.log(`📱 [${fromPhone}]: ${messageBody}`);
-      res.sendStatus(200); // Acknowledge webhook immediately
+      res.sendStatus(200);
 
-      // Smart ack: only for tool-related requests
+      // ── Smart ack: only for tool-related requests ────────────
       const actionKeywords = ["run tests", "fix", "create issue", "merge", "delete branch", "execute pr", "cleanup"];
       const needsAck = actionKeywords.some(kw => messageBody.toLowerCase().includes(kw));
       if (needsAck) send(fromPhone, `⚙️ Processing...`);
 
-      // Process asynchronously
       runAgent(fromPhone, messageBody.trim())
         .then(reply => send(fromPhone, reply))
         .catch(err => console.error("❌ Agent error:", err.message));
@@ -832,259 +732,63 @@ async function ghGet(path) {
   return res.data;
 }
 
-async function getDefaultBranchSHA(repo, headers = ghHeaders()) {
+async function getDefaultBranchSHA(repo, headers) {
   try {
-    const repoInfo = await ghGet(`/repos/${repo.repo}`);
-    if (!repoInfo.default_branch) {
-      console.log(`⚠️ No default branch found for ${repo.repo}`);
-      return null;
-    }
-    const res = await axios.get(`https://api.github.com/repos/${repo.repo}/git/ref/heads/${repoInfo.default_branch}`, { headers });
+    const res = await axios.get(`https://api.github.com/repos/${repo.repo}/git/ref/heads/${repo.branch}`, { headers });
     return res.data.object.sha;
-  } catch (err) {
-    console.log(`⚠️ Failed to get default branch SHA: ${err.message}`);
-    return null;
-  }
+  } catch (_) { return null; }
 }
 
-async function createBranch(repo, branchName, sha = null, headers = ghHeaders()) {
-  try {
-    const fromSha = sha || (await getDefaultBranchSHA(repo, headers));
-    if (!fromSha) {
-      console.log(`❌ Cannot create branch ${branchName}: no base SHA available`);
-      return null;
-    }
-    const res = await axios.post(`https://api.github.com/repos/${repo.repo}/git/refs`, { ref: `refs/heads/${branchName}`, sha: fromSha }, { headers });
-    console.log(`✅ Branch created: ${branchName}`);
-    return res.data;
-  } catch (err) {
-    console.log(`❌ Failed to create branch ${branchName}: ${err.message}`);
-    return null;
-  }
+async function createBranch(repo, branchName, sha, headers) {
+  await axios.post(`https://api.github.com/repos/${repo.repo}/git/refs`, { ref: `refs/heads/${branchName}`, sha }, { headers });
 }
 
-async function commitFile(repo, branchName, filePath, content, message, headers = ghHeaders()) {
+async function commitFile(repo, branchName, filePath, content, message, headers) {
+  let existingSha;
   try {
-    let existingSha;
-    try {
-      const ex = await axios.get(`https://api.github.com/repos/${repo.repo}/contents/${filePath}?ref=${branchName}`, { headers });
-      existingSha = ex.data.sha;
-    } catch (_) {}
-    const payload = { message, content: Buffer.from(content).toString("base64"), branch: branchName };
-    if (existingSha) payload.sha = existingSha;
-    const res = await axios.put(`https://api.github.com/repos/${repo.repo}/contents/${filePath}`, payload, { headers });
-    console.log(`✅ File committed: ${filePath}`);
-    return res.data;
-  } catch (err) {
-    console.log(`❌ Failed to commit ${filePath}: ${err.message}`);
-    return null;
-  }
+    const ex = await axios.get(`https://api.github.com/repos/${repo.repo}/contents/${filePath}?ref=${branchName}`, { headers });
+    existingSha = ex.data.sha;
+  } catch (_) {}
+  const payload = { message, content: Buffer.from(content).toString("base64"), branch: branchName };
+  if (existingSha) payload.sha = existingSha;
+  await axios.put(`https://api.github.com/repos/${repo.repo}/contents/${filePath}`, payload, { headers });
 }
 
 async function loadReport(phone, repo, runId, run) {
   try {
-    if (!runId || !repo) { 
-      console.log("⚠️ loadReport: missing runId or repo");
-      return;
-    }
-    
-    const artRes = await ghGet(`/repos/${repo.repo}/actions/runs/${runId}/artifacts`);
-    const artifacts = artRes.artifacts || [];
-    
-    if (artifacts.length === 0) {
-      console.log(`⚠️ No artifacts found for run ${runId}`);
-      lastReports[phone] = { repo: repo.repo, repoName: repo.name, runUrl: run?.html_url, conclusion: run?.conclusion, summary: null, fetchedAt: Date.now() };
-      return;
-    }
-    
-    // Look for JSON report OR Playwright HTML report
-    const jsonArt = artifacts.find(a => a.name.includes("json-report") || a.name.includes("test-report") || a.name.includes("results"));
-    const htmlArt = artifacts.find(a => a.name === "playwright-report" || a.name.includes("playwright"));
-    
-    const reportArt = jsonArt || htmlArt;
-    if (!reportArt) {
-      console.log(`⚠️ No test report found. Available artifacts: ${artifacts.map(a=>a.name).join(', ')}`);
-      console.log(`💡 Tip: Configure JSON reporter in playwright.config.ts to get test details`);
-      lastReports[phone] = { repo: repo.repo, repoName: repo.name, runUrl: run?.html_url, conclusion: run?.conclusion, summary: null, fetchedAt: Date.now() };
-      return;
-    }
-    
-    console.log(`📦 Downloading artifact: ${reportArt.name} (${Math.round(reportArt.size_in_bytes / 1024)}KB)`);
-    const dlRes = await axios.get(reportArt.archive_download_url, { 
-      headers: { Authorization: `token ${GITHUB_TOKEN}` }, 
-      responseType: "arraybuffer", 
-      maxRedirects: 5,
-      timeout: 30000
-    });
-    
-    if (!dlRes.data || dlRes.data.length === 0) {
-      console.log("⚠️ Downloaded artifact is empty");
-      return;
-    }
-    
+    const artRes  = await ghGet(`/repos/${repo.repo}/actions/runs/${runId}/artifacts`);
+    const jsonArt = artRes.artifacts.find(a => a.name === "json-report");
+    if (!jsonArt) { lastReports[phone] = { repo, repoName: repo.name, runUrl: run.html_url, conclusion: run.conclusion, summary: null, fetchedAt: Date.now() }; return; }
+    const dlRes = await axios.get(`https://api.github.com/repos/${repo.repo}/actions/artifacts/${jsonArt.id}/zip`, { headers: { Authorization: `token ${GITHUB_TOKEN}` }, responseType: "arraybuffer", maxRedirects: 5 });
     const { default: JSZip } = await import("jszip");
-    const zip = await JSZip.loadAsync(dlRes.data);
-    
-    // Try to find JSON report first (multiple possible names)
-    let reportFile = zip.file("test-results.json") || 
-                     zip.file("index.json") || 
-                     zip.file("playwright-results.json") || 
-                     zip.file("test-results/results.json") || 
-                     zip.file("results.json");
-    
-    // Search for JSON in root and shallow dirs
-    if (!reportFile) {
-      const allFiles = Object.keys(zip.files);
-      const jsonFiles = allFiles.filter(f => 
-        f.endsWith(".json") && 
-        !f.includes("node_modules") && 
-        !f.includes("trace/") &&
-        (f.split('/').length <= 2 || f.includes("test") || f.includes("result"))
-      );
-      if (jsonFiles.length > 0) {
-        console.log(`ℹ️ Found JSON report: ${jsonFiles[0]}`);
-        reportFile = zip.file(jsonFiles[0]);
-      }
-    }
-    
-    if (!reportFile) {
-      console.log(`⚠️ No JSON report in artifact. Files: ${Object.keys(zip.files).filter(f=>!f.includes('/')).slice(0,10).join(', ')}`);
-      console.log(`💡 Add to playwright.config.ts: reporter: [['json', { outputFile: 'results.json' }]`);
-      // Return empty summary - run completed but no detailed results
-      lastReports[phone] = { 
-        repo: repo.repo, 
-        repoName: repo.name || repo.repo.split('/')[1], 
-        runUrl: run?.html_url || `https://github.com/${repo.repo}/actions/runs/${runId}`, 
-        conclusion: run?.conclusion || "completed",
-        summary: { passed: 0, failed: 0, skipped: 0, total: 0, duration: 0, passedTests: [], failedTests: [], skippedTests: [] }, 
-        fetchedAt: Date.now() 
-      };
-      return;
-    }
-    
-    const reportContent = await reportFile.async("string");
-    if (!reportContent || reportContent.trim().length === 0) {
-      console.log("⚠️ Report file is empty");
-      return;
-    }
-    
-    let report;
-    try {
-      report = JSON.parse(reportContent);
-    } catch (parseErr) {
-      console.log(`⚠️ Failed to parse JSON: ${parseErr.message}`);
-      return;
-    }
-    
-    if (!report || typeof report !== 'object') {
-      console.log("⚠️ Invalid report structure");
-      return;
-    }
-    
-    const summary = extractSummary(report);
-    lastReports[phone] = {
-      repo: repo.repo,
-      repoName: repo.name || repo.repo.split('/')[1],
-      runUrl: run?.html_url || `https://github.com/${repo.repo}/actions/runs/${runId}`,
-      conclusion: run?.conclusion || "completed",
-      summary,
-      fetchedAt: Date.now()
-    };
-    
-    console.log(`✅ Report loaded: ${summary.passed}p ${summary.failed}f ${summary.skipped}s (${summary.duration}s)`);
-  } catch (err) {
-    console.error(`❌ loadReport: ${err.message} (${err.code || 'unknown'})`);
-  }
+    const zip  = await JSZip.loadAsync(dlRes.data);
+    const file = zip.file("playwright-results.json");
+    if (!file) return;
+    const summary = extractSummary(JSON.parse(await file.async("string")));
+    lastReports[phone] = { repo, repoName: repo.name, runUrl: run.html_url, conclusion: run.conclusion, summary, fetchedAt: Date.now() };
+    console.log(`✅ Report: ${summary.passed}p ${summary.failed}f ${summary.skipped}s`);
+  } catch (err) { console.error("❌ loadReport:", err.message); }
 }
 
 function extractSummary(report) {
-  const s = { passed: 0, failed: 0, skipped: 0, total: 0, duration: 0, failedTests: [], skippedTests: [], passedTests: [] };
-  
-  if (!report || typeof report !== 'object') {
-    console.log("⚠️ Invalid report format");
-    return s;
-  }
-  
-  function walk(suite, fp = "") {
-    if (!suite || typeof suite !== 'object') return;
-    
-    const file = suite.file || suite.path || fp || "unknown";
-    
-    // Walk specs (Playwright format)
-    for (const spec of suite.specs || []) {
-      if (!spec || typeof spec !== 'object') continue;
-      
-      for (const test of spec.tests || []) {
-        if (!test || typeof test !== 'object') continue;
-        
-        const status = test.status || test.results?.[0]?.status || "unknown";
-        const error = test.results?.[0]?.error?.message || test.error?.message || null;
-        const duration = test.results?.[0]?.duration || test.duration || 0;
-        
-        s.duration += duration;
-        
-        const testTitle = spec.title || test.title || `Test@${file}`;
-        
-        if (status === "passed" || status === "expected") {
-          s.passed++;
-          s.passedTests.push({ title: testTitle, file });
-        } else if (status === "failed" || status === "unexpected") {
-          s.failed++;
-          s.failedTests.push({ title: testTitle, file, error: error ? error.slice(0, 500) : "No error" });
-        } else if (status === "skipped" || status === "pending") {
-          s.skipped++;
-          s.skippedTests.push({ title: testTitle, file });
-        } else {
-          console.log(`⚠️ Unknown test status: "${status}"`);
-        }
+  const s = { passed:0, failed:0, skipped:0, total:0, duration:0, failedTests:[], skippedTests:[], passedTests:[] };
+  function walk(suite, fp="") {
+    const file = suite.file||fp;
+    for (const spec of suite.specs||[]) {
+      for (const test of spec.tests||[]) {
+        const status = test.status||test.results?.[0]?.status;
+        const error  = test.results?.[0]?.error?.message||null;
+        s.duration  += test.results?.[0]?.duration||0;
+        if (status==="passed"||status==="expected")        { s.passed++;  s.passedTests.push({title:spec.title,file}); }
+        else if (status==="failed"||status==="unexpected") { s.failed++;  s.failedTests.push({title:spec.title,file,error}); }
+        else if (status==="skipped"||status==="pending")   { s.skipped++; s.skippedTests.push({title:spec.title,file}); }
       }
     }
-    
-    // Walk tests (Direct format)
-    for (const test of suite.tests || []) {
-      if (!test || typeof test !== 'object') continue;
-      
-      const status = test.status || "unknown";
-      const error = test.error?.message || test.error || null;
-      const duration = test.duration || 0;
-      
-      s.duration += duration;
-      
-      const testTitle = test.title || `Test@${file}`;
-      
-      if (status === "passed" || status === "expected") {
-        s.passed++;
-        s.passedTests.push({ title: testTitle, file });
-      } else if (status === "failed" || status === "unexpected") {
-        s.failed++;
-        s.failedTests.push({ title: testTitle, file, error: error ? String(error).slice(0, 500) : "No error" });
-      } else if (status === "skipped" || status === "pending") {
-        s.skipped++;
-        s.skippedTests.push({ title: testTitle, file });
-      }
-    }
-    
-    // Walk nested suites
-    for (const child of suite.suites || []) {
-      walk(child, file);
-    }
+    for (const child of suite.suites||[]) walk(child,file);
   }
-  
-  // Start walking from root suites
-  for (const suite of report.suites || []) {
-    walk(suite);
-  }
-  
-  // Fallback: if no suites, try direct tests
-  if (!report.suites && report.tests) {
-    for (const test of report.tests) {
-      walk({ tests: [test] });
-    }
-  }
-  
-  s.total = s.passed + s.failed + s.skipped;
-  s.duration = Math.round(s.duration / 1000);
-  
+  for (const suite of report.suites||[]) walk(suite);
+  s.total    = s.passed+s.failed+s.skipped;
+  s.duration = Math.round(s.duration/1000);
   return s;
 }
 
@@ -1116,12 +820,12 @@ async function send(toPhone, message) {
   } catch (err) { console.error("❌ WhatsApp send:", err.response?.data||err.message); }
 }
 
-// ─── NVIDIA instant acknowledgment — called before agent runs ──────
-// Uses Qwen with NO tools, just returns 1 short line
+// ─── Groq instant acknowledgment — called before agent runs ──────
+// Uses llama with NO tools, just returns 1 short line
 async function getGroqAck(message) {
   try {
-    const res = await axios.post(NVIDIA_URL, {
-      model:      NVIDIA_MODEL,
+    const res = await axios.post(GROQ_URL, {
+      model:      "llama-3.1-8b-instant", // smallest/fastest model for ack
       messages: [
         {
           role: "system",
@@ -1142,11 +846,11 @@ async function getGroqAck(message) {
       temperature: 0.3,
       max_tokens:  20,
     }, {
-      headers: { Authorization: `Bearer ${NVIDIA_API_KEY}`, "Accept": "application/json" },
+      headers: { Authorization: `Bearer ${GROQ_API_KEY}`, "Content-Type": "application/json" },
     });
     return res.data.choices[0].message.content.trim();
   } catch (_) {
-    return "🔍 On it..."; // fallback if NVIDIA fails
+    return "🔍 On it..."; // fallback if Groq fails
   }
 }
 
