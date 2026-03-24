@@ -36,7 +36,9 @@ const REPOS = [
 // ─── State ────────────────────────────────────────────────────────
 const chatHistory = {}; // { phone: [{role, content}] }
 const lastReports = {}; // { phone: reportData }
+const processedMessages = new Set(); // { messageId } - prevent duplicate processing
 const MAX_HISTORY = 10;
+const MESSAGE_DEDUP_TTL = 60000; // Clear duplicates after 1 minute
 
 // ════════════════════════════════════════════════════════════════════
 //  TOOLS — every action Groq can take
@@ -845,17 +847,32 @@ app.post("/webhook", async (req, res) => {
   try {
     const body = req.body;
     if (body.object && body.entry?.[0]?.changes?.[0]?.value?.messages) {
-      const fromPhone   = body.entry[0].changes[0].value.messages[0].from;
-      const messageBody = body.entry[0].changes[0].value.messages[0].text?.body;
+      const messageEntry = body.entry[0].changes[0].value.messages[0];
+      const messageId = messageEntry.id; // Unique message ID from Meta
+      
+      // Deduplication: Skip if we've already processed this message
+      if (processedMessages.has(messageId)) {
+        console.log(`⏭️ Skipping duplicate message: ${messageId}`);
+        return res.sendStatus(200);
+      }
+      
+      // Mark as processed
+      processedMessages.add(messageId);
+      setTimeout(() => processedMessages.delete(messageId), MESSAGE_DEDUP_TTL);
+      
+      const fromPhone = messageEntry.from;
+      const messageBody = messageEntry.text?.body;
       if (!messageBody) return res.sendStatus(200);
+      
       console.log(`📱 [${fromPhone}]: ${messageBody}`);
-      res.sendStatus(200);
+      res.sendStatus(200); // Acknowledge webhook immediately
 
-      // ── Smart ack: only for tool-related requests ────────────
+      // Smart ack: only for tool-related requests
       const actionKeywords = ["run tests", "fix", "create issue", "merge", "delete branch", "execute pr", "cleanup"];
       const needsAck = actionKeywords.some(kw => messageBody.toLowerCase().includes(kw));
       if (needsAck) send(fromPhone, `⚙️ Processing...`);
 
+      // Process asynchronously
       runAgent(fromPhone, messageBody.trim())
         .then(reply => send(fromPhone, reply))
         .catch(err => console.error("❌ Agent error:", err.message));
