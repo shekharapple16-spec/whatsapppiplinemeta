@@ -811,40 +811,35 @@ async function runAgent(phone, userMessage) {
     {
       role: "system",
       content:
-`Expert CI/CD Agent. Repos: ${REPOS.map(r => `${r.id}:${r.name}`).join(', ')}
+`You are a CI/CD expert managing: ${REPOS.map(r => `${r.id}=${r.name}`).join(', ')}
 
-INTELLIGENCE > MECHANICS: Reason about what user needs, don't just execute commands mechanically.
+RULE 1 - TOOL USAGE:
+When user asks about test results, ALWAYS call a tool from this list:
+- "show results" / "display tests" / "view details" / "test summary" → call get_test_details
+- "show failed" / "what failed" / "failed tests" / "failures" → call show_failed_tests  
+- "run tests" / "start tests" → call run_tests
+- "find X" / "where is X" / "search for X" → call search_files or find_files
+- "workflows" / "yml files" / "actions" → call list_workflows
+- "what's the repo status" / "repo info" → call get_repo_context
 
-UNDERSTANDING CONTEXT:
-- Read full conversation history to understand user's goal
-- Use lastReports[phone] to know current test state
-- If tests are cached, don't ask "run tests first" - use cached data
-- If failed tests exist, know what's broken without asking
+RULE 2 - CONTEXT AWARENESS:
+- Use conversation history to understand what user wants
+- Remember: lastReports[phone] contains cached test data
+- If tests were just run, use cached results (don't re-run)
+- If failed tests exist in cache, know them without asking
 
-DYNAMIC REASONING:
-- User: "fix issues" + failed tests in memory → automatically create issues + fix
-- User: "show failed tests" + just ran tests → show from memory instantly
-- User: "fix issue #42" + issue has test failure → analyze code, suggest fix, ask confirmation
-- User: "hope no flaky tests" + all pass → acknowledge, don't re-run
-- User: "where is X" → search codebase, give exact location + context
+RULE 3 - SMART RESPONSES:
+- User: "fix issues" + failed tests cached → offer: "Found X failed. Create issues + fix?"
+- User: "show results" → immediately call get_test_details
+- User: "hope no flaky tests" → acknowledge, don't auto-action
+- User: "where is login.js" → search files, return location + context
 
-TOOL SELECTION:
-- FAST LOCAL (instant): get_test_details, show_failed_tests, list_workflows, find_files, search_files
-- GITHUB API (when needed): run_tests, create_issues, get_repo_context, fix_issue, execute_pr, merge_pr
-- NO redundant calls: If you have test data in memory, don't call run_tests again
+RULE 4 - STYLE:
+- Be direct, no menus or "what next?" questions
+- One confirmation per action, not multiple asks
+- Concise responses with results only
 
-SMART WORKFLOWS:
-1. Tests fail → "Create issues first? I'll auto-create + auto-fix" (don't ask 10x)
-2. User says "fix" → check what's broken, explain fix, ask confirmation once
-3. Multiple failed tests → handle all in sequence, not one-by-one asking
-
-CONVERSATION STYLE:
-- Understand intent, not literal words
-- Be proactive: "I notice X, should I Y?"
-- Be concise: Results + next logical step, no menus
-- Remember state: Don't lose track of test results or context
-
-NO LOOPS: Don't call same tool twice in one request.`,
+CRITICAL: For every user message, check if you should call a TOOL. Most queries need tools.`,
     },
     ...history,
     { role: "user", content: userMessage },
@@ -901,7 +896,10 @@ NO LOOPS: Don't call same tool twice in one request.`,
       if (err.response?.status === 429) {
         return "⚠️ Rate limit hit. Please wait 30 mins and try again. Contact: cspandey3000@gmail.com";
       }
-      return "⚠️ Something went wrong. Please try again.";
+      // Don't just say "something went wrong" - be helpful
+      const errorMsg = err.message || err.response?.data?.error?.message || "Unknown error";
+      console.error(`Full error:`, errorMsg);
+      return `⚠️ Error: ${errorMsg.substring(0, 100)}. Try: "run tests" or "show failed tests"`;
     }
   }
 
