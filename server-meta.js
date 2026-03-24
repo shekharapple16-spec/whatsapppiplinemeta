@@ -18,7 +18,7 @@ const BOT_WEBHOOK_URL      = process.env.BOT_WEBHOOK_URL;
 const BOT_WEBHOOK_SECRET   = process.env.BOT_WEBHOOK_SECRET;
 
 const GROQ_URL   = "https://api.groq.com/openai/v1/chat/completions";
-const GROQ_MODEL = "llama-3.3-70b-versatile";
+const GROQ_MODEL = "openai/gpt-oss-120b";
 
 // ─── Repo Config ──────────────────────────────────────────────────
 const REPOS = [
@@ -50,6 +50,19 @@ const MAX_HISTORY = 10;
 // ════════════════════════════════════════════════════════════════════
 
 const TOOL_DEFINITIONS = [
+  {
+    type: "function",
+    function: {
+      name: "get_test_details",
+      description: "Get detailed test results (passed/failed/skipped) from last test run - INSTANT LOCAL",
+      parameters: {
+        type: "object",
+        properties: {
+          repo_id: { type: "number", description: "Repo ID. Default 1." }
+        },
+      }
+    }
+  },
   {
     type: "function",
     function: {
@@ -336,12 +349,30 @@ async function executeTool(name, args, phone) {
 
   switch (name) {
 
+    case "get_test_details": {
+      try {
+        const report = lastReports[phone];
+        if (!report?.summary) return "No test results. Run tests first.";
+        const s = report.summary;
+        let details = `Passed: ${s.passed}, Failed: ${s.failed}, Skipped: ${s.skipped}\n`;
+        if (s.skippedTests?.length) {
+          details += `Skipped tests: ${s.skippedTests.map(t => t.title).join(', ')}`;
+        }
+        if (s.failedTests?.length) {
+          details += `\nFailed tests: ${s.failedTests.map(t => t.title).join(', ')}`;
+        }
+        return details;
+      } catch (err) {
+        return `Failed: ${err.message}`;
+      }
+    }
+
     case "list_workflows": {
       try {
         const workflows = await ghGet(`/repos/${repo.repo}/contents/.github/workflows`);
         if (!Array.isArray(workflows)) return "No workflows found.";
         const ymlFiles = workflows.filter(f => f.name.endsWith('.yml') || f.name.endsWith('.yaml'));
-        return `Found ${ymlFiles.length} YML workflows:\\n${ymlFiles.map(f => `- ${f.name}`).join('\\n')}`;
+        return `Found ${ymlFiles.length} YML workflows:\n${ymlFiles.map(f => `- ${f.name}`).join('\n')}`;
       } catch (err) {
         return `Failed to list workflows: ${err.message}`;
       }
@@ -403,7 +434,7 @@ async function executeTool(name, args, phone) {
           }
         }
         walkDir(process.cwd(), args.pattern || '*', args.query);
-        return results.length > 0 ? `Found in ${results.length} files: ${results.join(', ')}` : `Not found in matching files`;
+        return results.length > 0 ? `Found in ${results.length} files: ${results.join(', ')}` : `Not found`;
       } catch (err) {
         return `Failed: ${err.message}`;
       }
@@ -733,10 +764,11 @@ async function runAgent(phone, userMessage) {
       role: "system",
       content:
 `Expert CI/CD. Repos: ${REPOS.map(r => `${r.id}:${r.name}`).join(', ')}
-FAST LOCAL TOOLS (use first): list_workflows, find_files, search_files - instant, no API calls
-GITHUB TOOLS (when needed): get_repo_context, run_tests, create_issues, fix_issue, etc
-CONFIRM ACTIONS: Always ask user before create_issues, fix_issue, execute_pr, merge_pr, delete_branch, cleanup_branches, close_issue
-NO LOOPS: Don't call same tool twice. Ask user if ambiguous.`,
+FAST LOCAL TOOLS (use first): get_test_details, list_workflows, find_files, search_files - instant local queries
+GITHUB TOOLS (when needed): get_repo_context, run_tests, create_issues, fix_issue, execute_pr, merge_pr, delete_branch
+CONFIRM ACTIONS: ask user to confirm before create_issues, fix_issue, execute_pr, merge_pr, delete_branch, close_issue
+DIRECT: Answer what user asks. No menus, no "what next?", no clarifying questions unless truly ambiguous.
+NO LOOPS: Don't call same tool twice in one request.`,
     },
     ...history,
     { role: "user", content: userMessage },
