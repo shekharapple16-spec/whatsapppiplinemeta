@@ -1138,7 +1138,6 @@ function extractSummary(report) {
 }
 
 // ─── Extract helpers ──────────────────────────────────────────────
-const path = { basename: (p="") => p.split('/').pop(), dirname: (p="") => p.split('/').slice(0,-1).join('/') };
 
 function extractField(body="", field) {
   const m = body.match(new RegExp(`\\*\\*${field}:\\*\\*\\s*\`([^\`]+)\``));
