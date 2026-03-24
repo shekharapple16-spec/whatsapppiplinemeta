@@ -19,7 +19,7 @@ const GROQ_API_KEY         = process.env.GROQ_API_KEY;
 const BOT_WEBHOOK_SECRET   = process.env.BOT_WEBHOOK_SECRET;
 
 const GROQ_URL        = "https://api.groq.com/openai/v1/chat/completions";
-const GROQ_MODEL      = "qwen/qwen3-32b";
+const GROQ_MODEL      = "groq/compound";
 const GROQ_FAST_MODEL = "llama-3.1-8b-instant";
 
 // ─── Repo Config ──────────────────────────────────────────────────
