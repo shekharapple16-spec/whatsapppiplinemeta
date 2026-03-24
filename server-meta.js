@@ -18,7 +18,7 @@ const BOT_WEBHOOK_URL      = process.env.BOT_WEBHOOK_URL;
 const BOT_WEBHOOK_SECRET   = process.env.BOT_WEBHOOK_SECRET;
 
 const GROQ_URL   = "https://api.groq.com/openai/v1/chat/completions";
-const GROQ_MODEL = "openai/gpt-oss-120b";
+const GROQ_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct";
 
 // ─── Repo Config ──────────────────────────────────────────────────
 const REPOS = [
@@ -30,14 +30,7 @@ const REPOS = [
     aiFixWorkflow: "ai-fix.yml",
     branch: "master",
   },
-  {
-    id: 2, name: "Repo Two",
-    keywords: ["repo2", "two", "2"],
-    repo: "your-username/your-repo-2",
-    workflow: "playwright.yml",
-    aiFixWorkflow: "ai-fix.yml",
-    branch: "main",
-  },
+ 
 ];
 
 // ─── State ────────────────────────────────────────────────────────
