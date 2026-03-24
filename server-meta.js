@@ -80,7 +80,20 @@ const TOOL_DEFINITIONS = [
     type: "function",
     function: {
       name: "create_issues",
-      description: "Create GitHub issues for failed tests. Checks existing issues first to avoid duplicates.",
+      description: "Ask user to confirm before creating issues for failed tests",
+      parameters: {
+        type: "object",
+        properties: {
+          repo_id: { type: "number", description: "Repo ID. Default 1." }
+        },
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "confirm_create_issues",
+      description: "Actually create GitHub issues after user confirms",
       parameters: {
         type: "object",
         properties: {
@@ -93,7 +106,22 @@ const TOOL_DEFINITIONS = [
     type: "function",
     function: {
       name: "fix_issue",
-      description: "AI-fix a GitHub issue: triggers Playwright agent in GitHub Actions, captures DOM+error, Groq writes fix, creates PR",
+      description: "Ask user to confirm before fixing a GitHub issue",
+      parameters: {
+        type: "object",
+        properties: {
+          issue_number: { type: "number", description: "GitHub issue number to fix" },
+          repo_id:      { type: "number", description: "Repo ID. Default 1." }
+        },
+        required: ["issue_number"]
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "confirm_fix_issue",
+      description: "Actually fix a GitHub issue after user confirms",
       parameters: {
         type: "object",
         properties: {
@@ -108,7 +136,22 @@ const TOOL_DEFINITIONS = [
     type: "function",
     function: {
       name: "execute_pr",
-      description: "Run Playwright tests on a PR branch to verify the fix works",
+      description: "Ask user to confirm before running tests on a PR",
+      parameters: {
+        type: "object",
+        properties: {
+          pr_number: { type: "number", description: "Pull request number" },
+          repo_id:   { type: "number", description: "Repo ID. Default 1." }
+        },
+        required: ["pr_number"]
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "confirm_execute_pr",
+      description: "Actually run tests on PR after user confirms",
       parameters: {
         type: "object",
         properties: {
@@ -123,7 +166,22 @@ const TOOL_DEFINITIONS = [
     type: "function",
     function: {
       name: "delete_branch",
-      description: "Delete a git branch (e.g. after PR is merged)",
+      description: "Ask user to confirm before deleting a branch",
+      parameters: {
+        type: "object",
+        properties: {
+          branch_name: { type: "string", description: "Branch name to delete" },
+          repo_id:     { type: "number", description: "Repo ID. Default 1." }
+        },
+        required: ["branch_name"]
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "confirm_delete_branch",
+      description: "Actually delete branch after user confirms",
       parameters: {
         type: "object",
         properties: {
@@ -138,7 +196,20 @@ const TOOL_DEFINITIONS = [
     type: "function",
     function: {
       name: "cleanup_branches",
-      description: "Delete all merged ai-fix-* branches from the repo",
+      description: "Ask user to confirm before deleting all ai-fix branches",
+      parameters: {
+        type: "object",
+        properties: {
+          repo_id: { type: "number", description: "Repo ID. Default 1." }
+        },
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "confirm_cleanup_branches",
+      description: "Actually delete all ai-fix branches after user confirms",
       parameters: {
         type: "object",
         properties: {
@@ -151,7 +222,22 @@ const TOOL_DEFINITIONS = [
     type: "function",
     function: {
       name: "merge_pr",
-      description: "Merge a pull request",
+      description: "Ask user to confirm before merging a PR",
+      parameters: {
+        type: "object",
+        properties: {
+          pr_number: { type: "number", description: "PR number to merge" },
+          repo_id:   { type: "number", description: "Repo ID. Default 1." }
+        },
+        required: ["pr_number"]
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "confirm_merge_pr",
+      description: "Actually merge PR after user confirms",
       parameters: {
         type: "object",
         properties: {
@@ -166,7 +252,23 @@ const TOOL_DEFINITIONS = [
     type: "function",
     function: {
       name: "close_issue",
-      description: "Close a GitHub issue with a comment",
+      description: "Ask user to confirm before closing an issue",
+      parameters: {
+        type: "object",
+        properties: {
+          issue_number: { type: "number", description: "Issue number to close" },
+          comment:      { type: "string", description: "Comment to add before closing" },
+          repo_id:      { type: "number", description: "Repo ID. Default 1." }
+        },
+        required: ["issue_number"]
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "confirm_close_issue",
+      description: "Actually close issue after user confirms",
       parameters: {
         type: "object",
         properties: {
@@ -210,7 +312,11 @@ async function executeTool(name, args, phone) {
             const r = lastReports[phone];
             const s = r?.summary;
             if (!s) return `Run completed but no report found. URL: ${run.html_url}`;
-            return `✅${s.passed}P ❌${s.failed}F ⊝${s.skipped}S ${run.html_url}`;
+            const result = `✅${s.passed}P ❌${s.failed}F ⊝${s.skipped}S ${run.html_url}`;
+            if (s.failed > 0) {
+              return `${result}\\n\\nWhat next? \"create issues\", \"fix issues\", or \"done\"?`;
+            }
+            return result;
           }
           console.log(`⏳ [${Math.round(attempt*30/60)}m] ${run.status}`);
           attempt++;
@@ -271,17 +377,23 @@ async function executeTool(name, args, phone) {
       try {
         const report = lastReports[phone];
         if (!report?.summary) {
-          // Try to load latest report
-          const runsRes = await ghGet(`/repos/${repo.repo}/actions/runs?per_page=10&status=completed`);
-          for (const run of runsRes.workflow_runs) {
-            await loadReport(phone, repo, run.id, run);
-            if (lastReports[phone]?.summary) break;
-          }
+          return "No test results. Run tests first.";
         }
         const r = lastReports[phone];
-        if (!r?.summary?.failedTests?.length) return "No failed tests found. Nothing to create issues for.";
+        if (!r?.summary?.failedTests?.length) return "No failed tests found.";
+        const failedCount = r.summary.failedTests.length;
+        return `Found ${failedCount} failed test(s).\\nConfirm: \"yes create issues\" or \"cancel\"`;
+      } catch (err) {
+        return `Failed: ${err.message}`;
+      }
+    }
 
-        // Check existing issues to avoid duplicates
+    case "confirm_create_issues": {
+      try {
+        const report = lastReports[phone];
+        if (!report?.summary?.failedTests?.length) return "No failed tests to create issues for.";
+
+        const r = lastReports[phone];
         const existing = await ghGet(`/repos/${repo.repo}/issues?state=open&per_page=100`);
         const created = [], skipped = [];
 
@@ -290,31 +402,33 @@ async function executeTool(name, args, phone) {
             const t = i.title.toLowerCase().replace("🐛 [playwright] ", "").trim();
             return t === test.title.toLowerCase().trim() || t.includes(test.title.toLowerCase().trim());
           });
-          if (dup) { skipped.push(`#${dup.number} already exists for "${test.title}"`); continue; }
+          if (dup) { skipped.push(dup.number); continue; }
 
-          const body =
-            `## 🐛 Failed Playwright Test\n\n` +
-            `**Test:** \`${test.title}\`\n` +
-            `**File:** \`${test.file || "unknown"}\`\n` +
-            `**Repo:** \`${repo.repo}\`\n\n` +
-            `## Error\n\`\`\`\n${test.error || "No error"}\n\`\`\`\n\n` +
-            `## Reproduce\n\`\`\`bash\nnpx playwright test --grep "${test.title}"\n\`\`\`\n\n` +
-            `**Run:** ${r.runUrl}\n\n---\n*Auto-created by WhatsApp QA Bot 🤖*`;
-
+          const body = `Test: \`${test.title}\`\\nFile: \`${test.file || "unknown"}\`\\n\\nError:\\n\`\`\`\\n${test.error || "No error"}\`\`\`\\n\\nRun: ${r.runUrl}`;
           const issue = await axios.post(
             `https://api.github.com/repos/${repo.repo}/issues`,
             { title: `🐛 [Playwright] ${test.title}`, body, labels: ["bug", "playwright", "automated"] },
             { headers: { ...ghHeaders(), "Content-Type": "application/json" } }
           );
-          created.push(`#${issue.data.number} "${test.title}" → ${issue.data.html_url}`);
+          created.push(issue.data.number);
         }
-        return `✅ Created ${created.length} issues.`;
+        return `✅ Created ${created.length} issues${skipped.length ? ` (${skipped.length} duplicates skipped)` : ''}.`;
       } catch (err) {
         return `Failed to create issues: ${err.message}`;
       }
     }
 
     case "fix_issue": {
+      try {
+        const issue = await ghGet(`/repos/${repo.repo}/issues/${args.issue_number}`);
+        const testTitle = issue.title.replace("🐛 [Playwright] ", "").trim();
+        return `Ready to fix issue #${args.issue_number}: "${testTitle}"?\\nConfirm: "yes fix #${args.issue_number}" or "cancel"`;
+      } catch (err) {
+        return `Failed: ${err.message}`;
+      }
+    }
+
+    case "confirm_fix_issue": {
       try {
         const issue = await ghGet(`/repos/${repo.repo}/issues/${args.issue_number}`);
         const testTitle = issue.title.replace("🐛 [Playwright] ", "").trim();
@@ -335,11 +449,20 @@ async function executeTool(name, args, phone) {
 
         return `🤖 Fixing #${args.issue_number}. PR ready ~3-5m.`;
       } catch (err) {
-        return `Failed to trigger fix for #${args.issue_number}: ${err.message}`;
+        return `Failed to trigger fix: ${err.message}`;
       }
     }
 
     case "execute_pr": {
+      try {
+        const pr = await ghGet(`/repos/${repo.repo}/pulls/${args.pr_number}`);
+        return `Run tests on PR #${args.pr_number}?\\nConfirm: "yes execute PR #${args.pr_number}" or "cancel"`;
+      } catch (err) {
+        return `Failed: ${err.message}`;
+      }
+    }
+
+    case "confirm_execute_pr": {
       try {
         const pr = await ghGet(`/repos/${repo.repo}/pulls/${args.pr_number}`);
         const prBranch = pr.head.ref;
@@ -369,9 +492,8 @@ async function executeTool(name, args, phone) {
             await loadReport(phone, repo, trackedRunId, run);
             const s = lastReports[phone]?.summary;
             if (s?.failed === 0) {
-              // Auto comment on PR
               await axios.post(`https://api.github.com/repos/${repo.repo}/issues/${args.pr_number}/comments`,
-                { body: `## ✅ Tests Passed\n\nPassed: ${s.passed}, Failed: ${s.failed}\n\n*Verified by WhatsApp QA Bot 🤖*` },
+                { body: `✅ Tests Passed: ${s.passed}P` },
                 { headers: { ...ghHeaders(), "Content-Type": "application/json" } }
               );
               return `✅ PR #${args.pr_number} PASSED. Safe to merge. ${run.html_url}`;
@@ -383,32 +505,40 @@ async function executeTool(name, args, phone) {
           attempt++;
         }
       } catch (err) {
-        return `Failed to execute PR: ${err.message}`;
+        return `Failed: ${err.message}`;
       }
     }
 
     case "delete_branch": {
+      return `Delete branch "${args.branch_name}"?\\nConfirm: "yes delete ${args.branch_name}" or "cancel"`;
+    }
+
+    case "confirm_delete_branch": {
       try {
         await axios.delete(
           `https://api.github.com/repos/${repo.repo}/git/refs/heads/${args.branch_name}`,
           { headers: ghHeaders() }
         );
-        return `Branch "${args.branch_name}" deleted successfully.`;
+        return `✅ Branch "${args.branch_name}" deleted.`;
       } catch (err) {
         return `Failed to delete branch "${args.branch_name}": ${err.response?.data?.message || err.message}`;
       }
     }
 
     case "cleanup_branches": {
+      return `Delete all ai-fix-* branches?\\nConfirm: "yes cleanup" or "cancel"`;
+    }
+
+    case "confirm_cleanup_branches": {
       try {
         const branches = await ghGet(`/repos/${repo.repo}/branches?per_page=100`);
         const aiFixBranches = branches.filter(b => b.name.startsWith('ai-fix-'));
-        const deleted = [], failed = [];
+        const deleted = [];
         for (const b of aiFixBranches) {
           try {
             await axios.delete(`https://api.github.com/repos/${repo.repo}/git/refs/heads/${b.name}`, { headers: ghHeaders() });
             deleted.push(b.name);
-          } catch (_) { failed.push(b.name); }
+          } catch (_) {}
         }
         return `✅ Deleted ${deleted.length} branches.`;
       } catch (err) {
@@ -418,18 +548,36 @@ async function executeTool(name, args, phone) {
 
     case "merge_pr": {
       try {
+        const pr = await ghGet(`/repos/${repo.repo}/pulls/${args.pr_number}`);
+        return `Merge PR #${args.pr_number}?\\nConfirm: "yes merge PR #${args.pr_number}" or "cancel"`;
+      } catch (err) {
+        return `Failed: ${err.message}`;
+      }
+    }
+
+    case "confirm_merge_pr": {
+      try {
         const res = await axios.put(
           `https://api.github.com/repos/${repo.repo}/pulls/${args.pr_number}/merge`,
           { merge_method: "squash" },
           { headers: { ...ghHeaders(), "Content-Type": "application/json" } }
         );
-        return `PR #${args.pr_number} merged successfully. SHA: ${res.data.sha?.slice(0,7)}`;
+        return `✅ PR #${args.pr_number} merged.`;
       } catch (err) {
         return `Failed to merge PR #${args.pr_number}: ${err.response?.data?.message || err.message}`;
       }
     }
 
     case "close_issue": {
+      try {
+        const issue = await ghGet(`/repos/${repo.repo}/issues/${args.issue_number}`);
+        return `Close issue #${args.issue_number}?\\nConfirm: "yes close #${args.issue_number}" or "cancel"`;
+      } catch (err) {
+        return `Failed: ${err.message}`;
+      }
+    }
+
+    case "confirm_close_issue": {
       try {
         if (args.comment) {
           await axios.post(`https://api.github.com/repos/${repo.repo}/issues/${args.issue_number}/comments`,
@@ -441,7 +589,7 @@ async function executeTool(name, args, phone) {
           { state: "closed" },
           { headers: { ...ghHeaders(), "Content-Type": "application/json" } }
         );
-        return `Issue #${args.issue_number} closed.`;
+        return `✅ Issue #${args.issue_number} closed.`;
       } catch (err) {
         return `Failed to close issue #${args.issue_number}: ${err.message}`;
       }
