@@ -100,56 +100,364 @@ PORT=3000 (optional, defaults to 3000)
 
 ---
 
-## 🚀 How to Set It Up
+## 🚀 Complete Setup Guide (2026 Latest)
 
-### **1. Prerequisites**
-- Node.js 16+ installed
-- Meta Business Account with WhatsApp Business API access
-- GitHub repository with Playwright tests in GitHub Actions
-- Groq API account
+### **Phase 1: Prerequisites**
 
-### **2. Installation**
+#### **1.1 System Requirements**
+- **Node.js**: v18.x or v20.x (v16 is deprecated in 2026)
+- **NPM**: v9.x or later
+- **Operating System**: Windows, macOS, or Linux
+- **Disk Space**: ~500MB for node_modules
+- **Internet**: Required for API calls
+
+Check versions:
+```bash
+node --version
+npm --version
+```
+
+#### **1.2 Required Accounts & Tokens**
+
+Before starting, you need:
+
+1. **Meta Business Account** (formerly Facebook Business)
+   - Visit: https://business.facebook.com
+   - Verify your business identity
+   - Phone number required for authentication
+   
+2. **GitHub Account** with:
+   - Access to repository with GitHub Actions enabled
+   - Permission to create personal access tokens
+   
+3. **Groq API Account**
+   - Sign up: https://console.groq.com
+   - Free tier available (2025+ pricing)
+
+#### **1.3 Hosting/Domain**
+- **Public Domain**: Required for WhatsApp webhooks (cannot be localhost)
+- **Options**: 
+  - Hosted on cloud (AWS, Azure, Heroku, Railway, Render)
+  - Self-hosted with tunneling (ngrok, Cloudflare Tunnel)
+  - Recommended: Railway.app or Render.com for 2026
+
+---
+
+### **Phase 2: Meta WhatsApp Business Setup (2026 Edition)**
+
+#### **2.1 Create WhatsApp Business App**
+
+1. Go to https://developers.facebook.com
+2. Click "Create App"
+3. Choose **App Type**: "Business" 
+4. Fill details:
+   - App Name: "QA Test Bot" (or your name)
+   - App Purpose: "Business Automation" or "Custom Integration"
+   - Contact Email: Your business email
+5. Click "Create App"
+
+#### **2.2 Add WhatsApp Product**
+
+1. In your app dashboard, click "Add Product"
+2. Find **WhatsApp** and click "Set Up"
+3. Choose integration method: **"Cloud API"** (recommended for 2026)
+4. Accept terms and conditions
+5. You'll be redirected to WhatsApp setup
+
+#### **2.3 Get WhatsApp Business Account**
+
+1. Under "WhatsApp" product settings, go to **"Getting Started"**
+2. You have 2 options:
+   - **New Account**: Create fresh (recommended)
+   - **Existing Account**: Link existing WhatsApp Business account
+
+**For New Account:**
+1. Click "Create a WhatsApp Business Account"
+2. Fill business details:
+   - Business Name
+   - Industry Category
+   - Phone Number (your WhatsApp-enabled business number)
+3. Complete verification (SMS or call)
+4. Copy your **PHONE_NUMBER_ID** (shown in dashboard)
+
+#### **2.4 Get API Access Token**
+
+1. Go to WhatsApp Product Settings → **"API Setup"**
+2. Under "Temporary Access Token" section:
+   - Click "Generate Token" 
+   - **Copy this token** (expires in ~24 hours)
+3. For production, create a **System User Token**:
+   - Go to Settings → Users → System Users
+   - Create new System User
+   - Add WhatsApp product to it
+   - Generate access token (doesn't expire as often)
+4. Store token securely (use `.env` file)
+
+**Token Permissions Required (2026)**:
+- `whatsapp_business_messaging`
+- `whatsapp_business_management`
+
+#### **2.5 Add Test Phone Numbers**
+
+1. Go to WhatsApp → **"To: Phone Number IDs"**
+2. Under "Test Numbers":
+   - Click "Add number"
+   - Add your personal WhatsApp number (for testing)
+   - Verify by entering code sent to WhatsApp
+   - Repeat for team members
+
+**Limit**: Test numbers are limited to 5 per app (in 2026)
+
+#### **2.6 Set Up Webhook for Message Delivery**
+
+1. Go to **WhatsApp Settings** → **Configuration**
+2. Find **Webhook URL** field
+3. Enter your server URL:
+   ```
+   https://yourdomain.com/webhook
+   ```
+4. **Callback Tokens**: 
+   - Click "Generate Token"
+   - Copy and save as `WEBHOOK_VERIFY_TOKEN` in `.env`
+
+5. **Subscribe to Webhooks**:
+   - Check these events:
+     - ✅ `messages` (receive incoming messages)
+     - ✅ `message_status` (delivery status updates)
+     - ✅ `message_template_status_update` (template approvals)
+   - Save settings
+
+#### **2.7 Test the Webhook Connection**
+
+Before starting your server:
+1. Ensure server is running on public domain
+2. Go back to webhook settings
+3. Click "Test Webhook" button
+4. You should see: ✅ "Webhook verified successfully"
+
+If it fails:
+- Check your domain is accessible: `curl https://yourdomain.com/health`
+- Verify WEBHOOK_VERIFY_TOKEN matches exactly
+- Check server is running and listening on port 3000
+
+---
+
+### **Phase 3: GitHub Setup**
+
+#### **3.1 Create Personal Access Token**
+
+1. Go to https://github.com/settings/tokens
+2. Click "Generate new token" (classic)
+3. Fill details:
+   - **Token name**: "QA Bot Token 2026"
+   - **Expiration**: 90 days (rotate regularly)
+   - **Scopes** (minimum required):
+     - ✅ `workflow` (trigger actions)
+     - ✅ `repo` (full control, can be narrowed)
+     - ✅ `read:repo_hook` (read webhooks)
+4. Click "Generate token"
+5. **Copy immediately** (won't be shown again)
+6. Store in `.env` as `GITHUB_TOKEN`
+
+#### **3.2 Verify Repository Access**
+
+Test your token:
+```bash
+curl -H "Authorization: token YOUR_GITHUB_TOKEN" \
+  https://api.github.com/user
+```
+
+Should return your GitHub username.
+
+#### **3.3 Find Your Workflow ID**
+
+1. Go to your repository on GitHub
+2. Click "Actions" tab
+3. Find your Playwright workflow (e.g., "Playwright Tests")
+4. Click on workflow name
+5. Check the workflow file URL pattern:
+   ```
+   https://github.com/OWNER/REPO/actions/workflows/FILENAME.yml
+   ```
+6. Find the numeric ID:
+   ```bash
+   curl -H "Authorization: token YOUR_GITHUB_TOKEN" \
+     https://api.github.com/repos/OWNER/REPO/actions/workflows
+   ```
+   Look for your workflow file, copy its `id`
+
+---
+
+### **Phase 4: Groq API Setup**
+
+#### **4.1 Create Groq Account**
+
+1. Visit https://console.groq.com
+2. Sign up with:
+   - Email address
+   - Password
+   - Organization name
+3. Verify email
+
+#### **4.2 Generate API Key**
+
+1. Go to **API Keys** section
+2. Click "Create New API Key"
+3. Name it: "WhatsApp QA Bot"
+4. Copy the key immediately (won't show again)
+5. Store in `.env` as `GROQ_API_KEY`
+
+#### **4.3 Verify API Access**
+
+Test your key:
+```bash
+curl -X POST https://api.groq.com/openai/v1/chat/completions \
+  -H "Authorization: Bearer YOUR_GROQ_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "mixtral-8x7b-32768",
+    "messages": [{"role": "user", "content": "say hello"}]
+  }'
+```
+
+Should return a chat response.
+
+---
+
+### **Phase 5: Local Environment Setup**
+
+#### **5.1 Clone & Install**
 
 ```bash
-# Clone or download the repository
-cd ui-mcp
+# Navigate to your workspace
+cd your-workspace-folder
+
+# Clone the repository
+git clone https://github.com/shekharapple16-spec/whatsapppiplinemeta.git
+cd whatsapppiplinemeta
 
 # Install dependencies
 npm install
 
-# Create .env file with all required credentials
-echo "META_PHONE_ID=..." >> .env
-echo "META_API_TOKEN=..." >> .env
-echo "WEBHOOK_VERIFY_TOKEN=..." >> .env
-echo "GITHUB_TOKEN=..." >> .env
-echo "GROQ_API_KEY=..." >> .env
-echo "PORT=3000" >> .env
+# Verify installation
+npm list axios dotenv express
 ```
 
-### **3. Configure Repos**
+#### **5.2 Create .env File**
 
-Edit the `REPOS` array in `server-meta.js` to add your repositories:
+Create file: `.env` in root directory
+
+```env
+# Meta WhatsApp (from Phase 2)
+META_PHONE_ID=123456789123456
+META_API_TOKEN=EAAxxxxxxxxxxxxxxxx
+WEBHOOK_VERIFY_TOKEN=your_random_verify_token_here
+
+# GitHub (from Phase 3)
+GITHUB_TOKEN=ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+
+# Groq API (from Phase 4)
+GROQ_API_KEY=gsk_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+
+# Server
+PORT=3000
+
+# Optional (for debugging)
+NODE_ENV=development
+DEBUG=*
+```
+
+⚠️ **NEVER commit `.env` file to git!** (Already in `.gitignore`)
+
+#### **5.3 Update Repository Configuration**
+
+Edit `server-meta.js`, find `REPOS` array (around line 17):
 
 ```javascript
 const REPOS = [
   {
     id: 1,
     name: "Your Project Name",
-    keywords: ["your", "keywords"],
-    repo: "owner/repo-name",
-    workflow: "workflow-file-id",
-    branch: "main",
+    keywords: ["your", "keywords", "for", "search"],
+    repo: "your-username/your-repo-name",
+    workflow: "123456789",  // Numeric ID from Phase 3.3
+    branch: "main",  // or "master" if that's your default
   },
+  // Add more repos as needed:
+  // {
+  //   id: 2,
+  //   name: "Another Project",
+  //   keywords: ["another"],
+  //   repo: "username/another-repo",
+  //   workflow: "987654321",
+  //   branch: "develop",
+  // },
 ];
 ```
 
-**How to find workflow ID:**
+**Get workflow ID** (detailed):
 ```bash
 curl -H "Authorization: token YOUR_GITHUB_TOKEN" \
-  https://api.github.com/repos/OWNER/REPO/actions/workflows
+  https://api.github.com/repos/YOUR_USERNAME/YOUR_REPO/actions/workflows | grep -A 5 "your-workflow-name"
 ```
 
-### **4. Start the Server**
+Look for the `"id"` field in JSON response.
+
+---
+
+### **Phase 6: Deploy to Public Server**
+
+#### **6.1 Option A: Using Railway.app (Easiest 2026 Method)**
+
+1. Sign up: https://railway.app
+2. Connect GitHub account
+3. Create new project → "Deploy from GitHub repo"
+4. Select your whatsapppiplinemeta repository
+5. Click "Deploy Now"
+6. Go to project settings → "Environment"
+7. Add environment variables from `.env`:
+   - `META_PHONE_ID`
+   - `META_API_TOKEN`
+   - `WEBHOOK_VERIFY_TOKEN`
+   - `GITHUB_TOKEN`
+   - `GROQ_API_KEY`
+   - `PORT` (auto-assigned, can override)
+8. Railway generates public URL automatically
+9. Copy URL: `https://yourdomain-xxxxx.railway.app`
+
+#### **6.2 Option B: Using Render.com**
+
+1. Sign up: https://render.com
+2. Create "New Web Service"
+3. Connect GitHub and select repository
+4. Settings:
+   - **Runtime**: Node
+   - **Start Command**: `node server-meta.js`
+5. Add environment variables (from `.env`)
+6. Click "Create Web Service"
+7. Get public URL from dashboard
+
+#### **6.3 Option C: Self-Hosted with ngrok (Testing Only)**
+
+```bash
+# Install ngrok from https://ngrok.com
+# Sign up and authenticate
+ngrok config add-authtoken YOUR_NGROK_TOKEN
+
+# Create tunnel to port 3000
+ngrok http 3000
+
+# Copy Forwarding URL: https://xxxxx-xx-xxx-xx.ngrok.app
+# Use this as WEBHOOK_VERIFY_URL
+```
+
+**Note**: ngrok URL changes each session. Use Railway/Render for production.
+
+---
+
+### **Phase 7: Start & Test**
+
+#### **7.1 Start Local Server**
 
 ```bash
 node server-meta.js
@@ -160,12 +468,81 @@ Expected output:
 ✅ Server running on port 3000
 ```
 
-### **5. Configure Meta Webhook**
+#### **7.2 Update Webhook URL in Meta**
 
-In Meta Business Suite, set:
-- **Callback URL**: `https://your-domain.com/webhook`
-- **Verify Token**: (same as `WEBHOOK_VERIFY_TOKEN` in .env)
-- **Subscribe to messages** and **message_template_status_update** webhooks
+1. Go to Meta Business Suite → WhatsApp Settings
+2. Update **Webhook URL** to your public domain:
+   ```
+   https://yourdomain.com/webhook
+   ```
+3. Update **Callback Token** to match `WEBHOOK_VERIFY_TOKEN`
+4. Click "Save"
+5. Click "Test Webhook" (should succeed ✅)
+
+#### **7.3 Send Test Message**
+
+1. Open WhatsApp on your phone
+2. Message your WhatsApp Business number with:
+   ```
+   run tests
+   ```
+3. You should receive:
+   - ✅ Immediate ack: "⚙️ Ok mere Aakaa..."
+   - ✅ Later: Test results with pass/fail counts
+
+#### **7.4 Check Server Logs**
+
+Your terminal should show:
+```
+📱 [+1234567890]: run tests
+🔧 Tool: run_tests | Args: {"repo_id":1}
+⏳ [0m] queued
+⏳ [1m] in_progress
+✅ Report: 5p 0f 0s
+✅ Tool run_tests: Tests done ✅5 passed ❌0 failed
+```
+
+---
+
+### **Phase 8: Production Hardening (2026 Best Practices)**
+
+#### **8.1 Security**
+- Use **secrets management** (don't hardcode tokens)
+- Rotate tokens every 90 days
+- Use **fine-grained GitHub tokens** (repo-specific)
+- Enable **two-factor authentication** on all accounts
+
+#### **8.2 Monitoring**
+- Set up error logging (Sentry, LogRocket, or similar)
+- Monitor webhook delivery status in Meta dashboard
+- Check GitHub Actions usage limits
+- Monitor Groq API quota
+
+#### **8.3 Rate Limiting**
+- Current limits (2026):
+  - Groq: Tier-dependent (free tier: 30 requests/min)
+  - GitHub: 5,000 requests/hour
+  - WhatsApp: 80 messages/hour per conversation (test numbers)
+  - WhatsApp Production: 1,000+ messages/hour (requires approval)
+
+#### **8.4 Database (Optional)**
+- Current: In-memory only (resets on restart)
+- Consider adding MongoDB for persistent chat history
+- Store test reports for trending/analysis
+
+---
+
+### **Phase 9: Troubleshooting Checklist**
+
+| Issue | Debug Steps |
+|---|---|
+| **Webhook not receiving messages** | 1) Check domain is public: `curl https://yourdomain.com/health` 2) Verify token match 3) Check firewall/network access |
+| **Bot not responding** | 1) Check server logs for errors 2) Verify GROQ_API_KEY is valid 3) Check GitHub token permissions |
+| **Tests not triggering** | 1) Verify workflow ID is correct 2) Check GitHub token has `workflow` scope 3) Ensure repository exists and is accessible |
+| **WhatsApp message not delivering** | 1) Check number is added as test number 2) Verify META_API_TOKEN is fresh 3) Check phone number format (+country code) |
+| **Rate limit errors** | 1) Wait 15+ seconds before retry 2) Check API quotas on respective dashboards 3) Consider upgrading plans |
+
+
 
 ---
 
