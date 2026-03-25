@@ -212,7 +212,7 @@ app.post("/webhook", async (req, res) => {
       res.sendStatus(200); // ACK Meta immediately
 
       // Quick ack to user
-      await send(fromPhone, "⚙️ On it...");
+      await send(fromPhone, "⚙️ Ok mere Aakaa...");
 
       // Run agent async
       runAgent(fromPhone, messageBody.trim())
