@@ -30,27 +30,30 @@ const REPOS = [
 ];
 
 // ─── State ────────────────────────────────────────────────────────
-const chatHistory     = {}; // { phone: [{role, content}] }
-const lastReports     = {}; // { phone: reportData }
-const MAX_HISTORY     = 10;
+const chatHistory  = {}; // { phone: [{role, content}] }
+const lastReports  = {}; // { phone: reportData }
+const MAX_HISTORY  = 10;
 
 // ─── Dedup — prevent Meta retry storms ───────────────────────────
-// Stores message IDs we have already processed.
-// Each entry auto-expires after 5 minutes so memory stays clean.
 const processedMsgIds = new Map(); // msgId → timestamp
 const DEDUP_TTL_MS    = 5 * 60 * 1000; // 5 minutes
 
 function isDuplicate(msgId) {
   const now = Date.now();
-
-  // Expire old entries
   for (const [id, ts] of processedMsgIds) {
     if (now - ts > DEDUP_TTL_MS) processedMsgIds.delete(id);
   }
-
   if (processedMsgIds.has(msgId)) return true;
   processedMsgIds.set(msgId, now);
   return false;
+}
+
+// ─── Action keywords — only these trigger the "⚙️ Ok mere Aakaa" ack
+const ACTION_KEYWORDS = ["run test", "execute test", "trigger test", "runtests"];
+
+function isActionMessage(text) {
+  const lower = text.toLowerCase();
+  return ACTION_KEYWORDS.some((kw) => lower.includes(kw));
 }
 
 // ════════════════════════════════════════════════════════════════════
@@ -128,7 +131,7 @@ async function executeTool(name, args, phone) {
 }
 
 // ════════════════════════════════════════════════════════════════════
-//  AGENT LOOP — Groq decides when to call run_tests
+//  AGENT LOOP — Groq handles everything, calls run_tests when needed
 // ════════════════════════════════════════════════════════════════════
 
 async function runAgent(phone, userMessage) {
@@ -138,13 +141,14 @@ async function runAgent(phone, userMessage) {
     {
       role: "system",
       content:
-        `You are a QA bot connected to GitHub Actions via tools.\n\n` +
+        `You are a friendly QA assistant bot connected to GitHub Actions.\n\n` +
         `AVAILABLE REPOS: ${REPOS.map((r) => `${r.id}. ${r.name} (${r.repo})`).join(", ")}\n\n` +
-        `BEHAVIOUR:\n` +
-        `- When the user says anything like "run tests", "execute tests", "trigger tests" → call run_tests tool immediately\n` +
+        `RULES:\n` +
+        `- Greet naturally, chat normally for casual messages (hi, hello, how are you, etc.)\n` +
+        `- When the user says anything like "run tests", "execute tests", "trigger tests", "runtests" → call run_tests tool immediately\n` +
         `- repo_id defaults to 1 unless user specifies otherwise\n` +
-        `- Reply in max 3 lines. Be factual and direct.\n` +
-        `- If the request is unrelated to running tests, politely say you only support running tests right now.`,
+        `- For test results: be factual and direct, max 3 lines\n` +
+        `- NEVER say "I can only help with running tests" — you are a friendly assistant who also happens to run tests`,
     },
     ...history,
     { role: "user", content: userMessage },
@@ -161,7 +165,7 @@ async function runAgent(phone, userMessage) {
           messages,
           tools:       TOOL_DEFINITIONS,
           tool_choice: "auto",
-          temperature: 0.1,
+          temperature: 0.7, // slightly higher for natural conversation
           max_tokens:  512,
         },
         { headers: { Authorization: `Bearer ${GROQ_API_KEY}`, "Content-Type": "application/json" } }
@@ -226,14 +230,14 @@ app.post("/webhook", async (req, res) => {
       const msg         = body.entry[0].changes[0].value.messages[0];
       const fromPhone   = msg.from;
       const messageBody = msg.text?.body;
-      const msgId       = msg.id; // unique per message, same across Meta retries
+      const msgId       = msg.id;
 
-      // ── ACK Meta immediately — must happen before anything else ──
+      // ── ACK Meta immediately ──────────────────────────────────────
       res.sendStatus(200);
 
       if (!messageBody) return;
 
-      // ── Dedup: ignore Meta retries for the same message ──────────
+      // ── Dedup: skip Meta retries ──────────────────────────────────
       if (isDuplicate(msgId)) {
         console.log(`⚠️  Duplicate msgId ${msgId} — ignored`);
         return;
@@ -241,10 +245,12 @@ app.post("/webhook", async (req, res) => {
 
       console.log(`📱 [${fromPhone}] (${msgId}): ${messageBody}`);
 
-      // Quick ack to user
-      await send(fromPhone, "⚙️ Ok mere Aakaa...");
+      // ── Only send "⚙️ Ok mere Aakaa..." for action commands ───────
+      if (isActionMessage(messageBody)) {
+        await send(fromPhone, "⚙️ Ok mere Aakaa...");
+      }
 
-      // Run agent async
+      // Run agent async — replies to everything
       runAgent(fromPhone, messageBody.trim())
         .then((reply) => send(fromPhone, reply))
         .catch((err)  => console.error("❌ Agent error:", err.message));
