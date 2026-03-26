@@ -30,9 +30,28 @@ const REPOS = [
 ];
 
 // ─── State ────────────────────────────────────────────────────────
-const chatHistory = {}; // { phone: [{role, content}] }
-const lastReports = {}; // { phone: reportData }
-const MAX_HISTORY = 10;
+const chatHistory     = {}; // { phone: [{role, content}] }
+const lastReports     = {}; // { phone: reportData }
+const MAX_HISTORY     = 10;
+
+// ─── Dedup — prevent Meta retry storms ───────────────────────────
+// Stores message IDs we have already processed.
+// Each entry auto-expires after 5 minutes so memory stays clean.
+const processedMsgIds = new Map(); // msgId → timestamp
+const DEDUP_TTL_MS    = 5 * 60 * 1000; // 5 minutes
+
+function isDuplicate(msgId) {
+  const now = Date.now();
+
+  // Expire old entries
+  for (const [id, ts] of processedMsgIds) {
+    if (now - ts > DEDUP_TTL_MS) processedMsgIds.delete(id);
+  }
+
+  if (processedMsgIds.has(msgId)) return true;
+  processedMsgIds.set(msgId, now);
+  return false;
+}
 
 // ════════════════════════════════════════════════════════════════════
 //  TOOL DEFINITION — only run_tests
@@ -204,12 +223,23 @@ app.post("/webhook", async (req, res) => {
   try {
     const body = req.body;
     if (body.object && body.entry?.[0]?.changes?.[0]?.value?.messages) {
-      const fromPhone   = body.entry[0].changes[0].value.messages[0].from;
-      const messageBody = body.entry[0].changes[0].value.messages[0].text?.body;
-      if (!messageBody) return res.sendStatus(200);
+      const msg         = body.entry[0].changes[0].value.messages[0];
+      const fromPhone   = msg.from;
+      const messageBody = msg.text?.body;
+      const msgId       = msg.id; // unique per message, same across Meta retries
 
-      console.log(`📱 [${fromPhone}]: ${messageBody}`);
-      res.sendStatus(200); // ACK Meta immediately
+      // ── ACK Meta immediately — must happen before anything else ──
+      res.sendStatus(200);
+
+      if (!messageBody) return;
+
+      // ── Dedup: ignore Meta retries for the same message ──────────
+      if (isDuplicate(msgId)) {
+        console.log(`⚠️  Duplicate msgId ${msgId} — ignored`);
+        return;
+      }
+
+      console.log(`📱 [${fromPhone}] (${msgId}): ${messageBody}`);
 
       // Quick ack to user
       await send(fromPhone, "⚙️ Ok mere Aakaa...");
@@ -218,6 +248,7 @@ app.post("/webhook", async (req, res) => {
       runAgent(fromPhone, messageBody.trim())
         .then((reply) => send(fromPhone, reply))
         .catch((err)  => console.error("❌ Agent error:", err.message));
+
     } else {
       res.sendStatus(200);
     }
@@ -279,7 +310,7 @@ function extractSummary(report) {
         const status = test.status || test.results?.[0]?.status;
         const error  = test.results?.[0]?.error?.message || null;
         s.duration  += test.results?.[0]?.duration || 0;
-        if (status === "passed"  || status === "expected")   { s.passed++;  s.passedTests.push({ title: spec.title }); }
+        if (status === "passed"  || status === "expected")       { s.passed++;  s.passedTests.push({ title: spec.title }); }
         else if (status === "failed" || status === "unexpected") { s.failed++;  s.failedTests.push({ title: spec.title, error }); }
         else if (status === "skipped" || status === "pending")   { s.skipped++; s.skippedTests.push({ title: spec.title }); }
       }
