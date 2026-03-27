@@ -14,7 +14,7 @@ const META_API_TOKEN       = process.env.META_API_TOKEN;
 const WEBHOOK_VERIFY_TOKEN = process.env.WEBHOOK_VERIFY_TOKEN;
 const GITHUB_TOKEN         = process.env.GITHUB_TOKEN;
 const GROQ_API_KEY         = process.env.GROQ_API_KEY;
-const BOT_WEBHOOK_SECRET   = process.env.BOT_WEBHOOK_SECRET; // ← env var is BOT_SECRET
+const BOT_WEBHOOK_SECRET   = process.env.BOT_SECRET; // ← correct env var name
 
 const GROQ_URL   = "https://api.groq.com/openai/v1/chat/completions";
 const GROQ_MODEL = "openai/gpt-oss-120b";
@@ -63,6 +63,18 @@ function isDuplicate(msgId) {
 const ACTION_KEYWORDS = ["run test", "execute test", "trigger test", "runtests", "fix this", "fix test", "retry fix", "fix again"];
 function isActionMessage(text) {
   return ACTION_KEYWORDS.some((kw) => text.toLowerCase().includes(kw));
+}
+
+// ─── Secret validator (shared across callbacks) ───────────────────
+function validateSecret(req, res) {
+  const incoming = (req.headers["x-bot-secret"] || req.body.secret || "").trim();
+  const expected = (BOT_WEBHOOK_SECRET || "").trim();
+  if (!incoming || incoming !== expected) {
+    console.error(`❌ 403 — secret mismatch. lengths: ${incoming.length} vs ${expected.length}`);
+    res.sendStatus(403);
+    return false;
+  }
+  return true;
 }
 
 // ════════════════════════════════════════════════════════════════════
@@ -271,47 +283,33 @@ function buildSessionContext(session) {
 }
 
 // ════════════════════════════════════════════════════════════════════
-//  /ai-fix-callback
-//  Fixture sends: { fix: { prTitle, rootCause, explanation, fix: { path, message, content } } }
-//  We unwrap fix.fix to get the actual file patch
+//  /ai-fix-callback — receives fix from fixture, does git ops
+//  Structure: req.body.fix = { prTitle, rootCause, explanation, fix: { path, message, content } }
 // ════════════════════════════════════════════════════════════════════
 
 app.post("/ai-fix-callback", async (req, res) => {
   try {
-    const incomingSecret = (req.headers["x-bot-secret"] || req.body.secret || "").trim();
-    const expectedSecret = (BOT_WEBHOOK_SECRET || "").trim();
-
-    console.log(`🔐 secret | incoming: "${incomingSecret.slice(0,6)}..." expected: "${expectedSecret.slice(0,6)}..." match: ${incomingSecret === expectedSecret}`);
-
-    if (!incomingSecret || incomingSecret !== expectedSecret) {
-      console.error(`❌ 403 — secret mismatch. lengths: ${incomingSecret.length} vs ${expectedSecret.length}`);
-      return res.sendStatus(403);
-    }
+    if (!validateSecret(req, res)) return;
 
     const { phone, testTitle, runUrl } = req.body;
+    const groqResult = req.body.fix;
+    const filePatch  = groqResult?.fix || groqResult; // unwrap nested .fix
 
-    // ── Unwrap the nested fix structure from Groq ─────────────────
-    // Groq returns: { prTitle, rootCause, explanation, fix: { path, message, content } }
-    // Fixture sends that whole object as req.body.fix
-    // So the actual file patch is at req.body.fix.fix
-    const groqResult = req.body.fix; // full Groq response object
-    const filePatch  = groqResult?.fix || groqResult; // try .fix first, fallback to root
-
-    console.log(`📦 fix keys: ${Object.keys(groqResult || {}).join(', ')}`);
-    console.log(`📄 filePatch keys: ${Object.keys(filePatch || {}).join(', ')}`);
+    console.log(`📦 fix keys: ${Object.keys(groqResult || {}).join(", ")}`);
+    console.log(`📄 filePatch keys: ${Object.keys(filePatch || {}).join(", ")}`);
 
     if (!filePatch?.content || !filePatch?.path) {
-      console.error(`❌ 400 — missing content or path. filePatch: ${JSON.stringify(filePatch)?.slice(0, 200)}`);
+      console.error(`❌ 400 — missing content/path. filePatch: ${JSON.stringify(filePatch)?.slice(0, 200)}`);
       return res.sendStatus(400);
     }
 
-    res.sendStatus(200); // ACK immediately
+    res.sendStatus(200);
 
-    const session    = getSession(phone);
-    const repo       = REPOS[0];
-    const headers    = { ...ghHeaders(), "Content-Type": "application/json" };
-    const prTitle    = groqResult?.prTitle   || `fix: ${testTitle}`;
-    const rootCause  = groqResult?.rootCause || "";
+    const session     = getSession(phone);
+    const repo        = REPOS[0];
+    const headers     = { ...ghHeaders(), "Content-Type": "application/json" };
+    const prTitle     = groqResult?.prTitle    || `fix: ${testTitle}`;
+    const rootCause   = groqResult?.rootCause  || "";
     const explanation = groqResult?.explanation || "";
 
     console.log(`\n🤖 Fix callback: "${testTitle}" | file: ${filePatch.path}`);
@@ -322,16 +320,14 @@ app.post("/ai-fix-callback", async (req, res) => {
     await send(phone, `🔨 Fix received! Creating PR for "${testTitle}"...`);
 
     try {
-      // Get branch SHA
       const refRes    = await axios.get(`https://api.github.com/repos/${repo.repo}/git/ref/heads/${repo.branch}`, { headers });
       const branchSHA = refRes.data.object.sha;
-
-      // Create fix branch
-      const safeName   = testTitle.replace(/[^a-zA-Z0-9]/g, "-").slice(0, 35).toLowerCase();
+      const safeName  = testTitle.replace(/[^a-zA-Z0-9]/g, "-").slice(0, 35).toLowerCase();
       const branchName = `ai-fix-${safeName}-${Date.now()}`;
-      await axios.post(`https://api.github.com/repos/${repo.repo}/git/refs`, { ref: `refs/heads/${branchName}`, sha: branchSHA }, { headers });
 
-      // Commit fixed file
+      await axios.post(`https://api.github.com/repos/${repo.repo}/git/refs`,
+        { ref: `refs/heads/${branchName}`, sha: branchSHA }, { headers });
+
       let existingSha;
       try {
         const ex = await axios.get(`https://api.github.com/repos/${repo.repo}/contents/${filePatch.path}?ref=${branchName}`, { headers });
@@ -346,7 +342,6 @@ app.post("/ai-fix-callback", async (req, res) => {
       if (existingSha) commitPayload.sha = existingSha;
       await axios.put(`https://api.github.com/repos/${repo.repo}/contents/${filePatch.path}`, commitPayload, { headers });
 
-      // Open PR
       const attemptNum = attempt?.attemptNumber || 1;
       const prRes = await axios.post(
         `https://api.github.com/repos/${repo.repo}/pulls`,
@@ -368,9 +363,10 @@ app.post("/ai-fix-callback", async (req, res) => {
       }
 
       await send(phone,
-        `✅ PR #${prRes.data.number} ready for "${testTitle}" (attempt #${attemptNum})\n` +
+        `✅ PR #${prRes.data.number} created for "${testTitle}" (attempt #${attemptNum})\n` +
         `🔗 ${prRes.data.html_url}\n` +
-        `Root cause: ${rootCause || "see PR"}`
+        `Root cause: ${rootCause || "see PR"}\n` +
+        `Tests will run automatically on the PR. You'll be notified of the result.`
       );
       console.log(`✅ PR #${prRes.data.number}: ${prRes.data.html_url}`);
 
@@ -385,7 +381,37 @@ app.post("/ai-fix-callback", async (req, res) => {
 });
 
 // ════════════════════════════════════════════════════════════════════
-//  WEBHOOK
+//  /pr-result — called by playwright.yml after PR tests complete
+//  Notifies user on WhatsApp whether the fix passed or failed
+// ════════════════════════════════════════════════════════════════════
+
+app.post("/pr-result", async (req, res) => {
+  try {
+    if (!validateSecret(req, res)) return;
+    res.sendStatus(200);
+
+    const { prNumber, status, message } = req.body;
+    console.log(`\n📊 PR #${prNumber} result: ${status}`);
+
+    // Find which phone number owns this PR across all sessions
+    for (const [phone, session] of Object.entries(sessionState)) {
+      const attempt = session.fixAttempts.find((a) => a.prNumber === prNumber);
+      if (attempt) {
+        attempt.status = status === "success" ? "verified_pass" : "verified_fail";
+        await send(phone, message);
+        console.log(`✅ Notified ${phone} about PR #${prNumber} result`);
+        return;
+      }
+    }
+
+    console.log(`⚠️  No session found for PR #${prNumber} — user not notified`);
+  } catch (err) {
+    console.error("❌ pr-result:", err.message);
+  }
+});
+
+// ════════════════════════════════════════════════════════════════════
+//  WEBHOOK — Meta WhatsApp
 // ════════════════════════════════════════════════════════════════════
 
 app.get("/webhook", (req, res) => {
@@ -459,7 +485,7 @@ function extractSummary(report) {
         const status  = test.status || test.results?.[0]?.status;
         const error   = test.results?.[0]?.error?.message || null;
         const rawFile = suite.file || spec.file || "";
-        const file    = rawFile.replace(/^.*?(tests[\\/])/, 'tests/').replace(/\\/g, '/');
+        const file    = rawFile.replace(/^.*?(tests[\\/])/, "tests/").replace(/\\/g, "/");
         s.duration   += test.results?.[0]?.duration || 0;
         if (status === "passed"  || status === "expected")       { s.passed++;  s.passedTests.push({ title: spec.title }); }
         else if (status === "failed" || status === "unexpected") { s.failed++;  s.failedTests.push({ title: spec.title, file, error }); }
