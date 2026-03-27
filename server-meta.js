@@ -14,7 +14,7 @@ const META_API_TOKEN       = process.env.META_API_TOKEN;
 const WEBHOOK_VERIFY_TOKEN = process.env.WEBHOOK_VERIFY_TOKEN;
 const GITHUB_TOKEN         = process.env.GITHUB_TOKEN;
 const GROQ_API_KEY         = process.env.GROQ_API_KEY;
-const BOT_WEBHOOK_SECRET   = process.env.BOT_SECRET; // ← env var is BOT_SECRET
+const BOT_WEBHOOK_SECRET   = process.env.BOT_WEBHOOK_SECRET; // ← env var is BOT_SECRET
 
 const GROQ_URL   = "https://api.groq.com/openai/v1/chat/completions";
 const GROQ_MODEL = "openai/gpt-oss-120b";
