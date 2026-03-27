@@ -14,7 +14,7 @@ const META_API_TOKEN       = process.env.META_API_TOKEN;
 const WEBHOOK_VERIFY_TOKEN = process.env.WEBHOOK_VERIFY_TOKEN;
 const GITHUB_TOKEN         = process.env.GITHUB_TOKEN;
 const GROQ_API_KEY         = process.env.GROQ_API_KEY;
-const BOT_WEBHOOK_SECRET   = process.env.BOT_WEBHOOK_SECRET;
+const BOT_WEBHOOK_SECRET   = process.env.BOT_SECRET; // ← env var is BOT_SECRET
 
 const GROQ_URL   = "https://api.groq.com/openai/v1/chat/completions";
 const GROQ_MODEL = "openai/gpt-oss-120b";
@@ -31,7 +31,7 @@ const REPOS = [
 ];
 
 // ════════════════════════════════════════════════════════════════════
-//  SESSION STATE — RAM only, per phone, current session
+//  SESSION STATE
 // ════════════════════════════════════════════════════════════════════
 
 const sessionState = {};
@@ -45,7 +45,7 @@ function getSession(phone) {
   return sessionState[phone];
 }
 
-// ─── Dedup — prevent Meta retry storms ───────────────────────────
+// ─── Dedup ───────────────────────────────────────────────────────
 const processedMsgIds = new Map();
 const DEDUP_TTL_MS    = 5 * 60 * 1000;
 
@@ -59,9 +59,8 @@ function isDuplicate(msgId) {
   return false;
 }
 
-// ─── Action keywords → "⚙️ Ok mere Aakaa..." ack ─────────────────
+// ─── Action keywords ──────────────────────────────────────────────
 const ACTION_KEYWORDS = ["run test", "execute test", "trigger test", "runtests", "fix this", "fix test", "retry fix", "fix again"];
-
 function isActionMessage(text) {
   return ACTION_KEYWORDS.some((kw) => text.toLowerCase().includes(kw));
 }
@@ -90,13 +89,12 @@ const TOOL_DEFINITIONS = [
       name: "fix_test",
       description:
         "Trigger an AI fix for a failing test. Dispatches ai-fix.yml which re-runs the test, " +
-        "the Playwright fixture captures live DOM + error at failure moment, calls Groq with " +
-        "Playwright best practices knowledge, and POSTs the fix back. " +
-        "Use when user says 'fix this', 'fix test', 'retry fix', 'fix again', or 'fix failed tc'.",
+        "the Playwright fixture captures live DOM + error, calls Groq, POSTs fix back. " +
+        "Use when user says 'fix this', 'fix test', 'retry fix', 'fix again', 'fix failed tc'.",
       parameters: {
         type: "object",
         properties: {
-          test_title: { type: "string", description: "Title of the failing test to fix. If not specified, fix the first failing test from last run." },
+          test_title: { type: "string", description: "Title of failing test. If not specified, fixes first failing test from last run." },
           repo_id:    { type: "number", description: "Repo ID. Default 1." },
         },
       },
@@ -113,7 +111,6 @@ async function executeTool(name, args, phone) {
   const session = getSession(phone);
   console.log(`🔧 Tool: ${name} | Args: ${JSON.stringify(args)}`);
 
-  // ── run_tests ──────────────────────────────────────────────────
   if (name === "run_tests") {
     try {
       await axios.post(
@@ -121,11 +118,9 @@ async function executeTool(name, args, phone) {
         { ref: repo.branch },
         { headers: ghHeaders() }
       );
-
       await sleep(12000);
       const runsRes      = await ghGet(`/repos/${repo.repo}/actions/runs?per_page=1`);
       const trackedRunId = runsRes.workflow_runs[0]?.id;
-
       let attempt = 0;
       while (true) {
         await sleep(30000);
@@ -134,11 +129,9 @@ async function executeTool(name, args, phone) {
           await loadReport(phone, repo, trackedRunId, run);
           const s = session.lastRun?.summary;
           if (!s) return `Run completed but no report found. URL: ${run.html_url}`;
-
           const failedList = s.failedTests?.length
             ? `Failed: ${s.failedTests.map((t) => t.title).join(", ")}`
             : "All passing! 🎉";
-
           return (
             `Tests done ✅${s.passed} passed  ❌${s.failed} failed  ⊝${s.skipped} skipped  ⏱${s.duration}s\n` +
             `${failedList}\nRun: ${run.html_url}`
@@ -152,12 +145,10 @@ async function executeTool(name, args, phone) {
     }
   }
 
-  // ── fix_test ───────────────────────────────────────────────────
   if (name === "fix_test") {
     if (!session.lastRun?.summary?.failedTests?.length) {
       return "No failed tests in memory. Please run tests first 🙏";
     }
-
     const failedTests = session.lastRun.summary.failedTests;
     const targetTitle = args.test_title?.trim();
     const testToFix   = targetTitle
@@ -165,40 +156,31 @@ async function executeTool(name, args, phone) {
       : failedTests[0];
 
     const attemptNumber = session.fixAttempts.filter((a) => a.testTitle === testToFix.title).length + 1;
-
     const attempt = {
-      attemptNumber,
-      testTitle:   testToFix.title,
-      testFile:    testToFix.file || "tests/",
-      prNumber:    null, prUrl: null, branch: null,
-      status:      "pending",
-      triggeredAt: Date.now(),
+      attemptNumber, testTitle: testToFix.title, testFile: testToFix.file || "tests/",
+      prNumber: null, prUrl: null, branch: null, status: "pending", triggeredAt: Date.now(),
     };
     session.fixAttempts.push(attempt);
     session.activeFix = { testTitle: testToFix.title, testFile: testToFix.file, attemptNumber };
 
     try {
-      const originalError = (testToFix.error || "").slice(0, 500);
-
       await axios.post(
         `https://api.github.com/repos/${repo.repo}/actions/workflows/${repo.aiFixWorkflow}/dispatches`,
         {
-          ref:    repo.branch,
+          ref: repo.branch,
           inputs: {
             test_file:      testToFix.file || "tests/",
             test_title:     testToFix.title,
             phone_number:   phone,
-            original_error: originalError,
+            original_error: (testToFix.error || "").slice(0, 500),
           },
         },
         { headers: ghHeaders() }
       );
-
       const isRetry = attemptNumber > 1;
       return (
         `${isRetry ? `🔄 Retry #${attemptNumber}` : "🔧 Fix"} triggered for "${testToFix.title}"\n` +
-        `Playwright running test → capturing live DOM + error → Groq fixing with best practices...\n` +
-        `PR will arrive in ~2-3 min ⏳`
+        `Playwright running → DOM captured → Groq fixing → PR coming in ~2-3 min ⏳`
       );
     } catch (err) {
       session.fixAttempts.pop();
@@ -215,8 +197,8 @@ async function executeTool(name, args, phone) {
 // ════════════════════════════════════════════════════════════════════
 
 async function runAgent(phone, userMessage) {
-  const history = chatHistory[phone] || [];
-  const session = getSession(phone);
+  const history    = chatHistory[phone] || [];
+  const session    = getSession(phone);
   const sessionCtx = buildSessionContext(session);
 
   const messages = [
@@ -239,7 +221,6 @@ async function runAgent(phone, userMessage) {
   ];
 
   let response;
-
   for (let step = 0; step < 10; step++) {
     try {
       const res = await axios.post(
@@ -247,13 +228,10 @@ async function runAgent(phone, userMessage) {
         { model: GROQ_MODEL, messages, tools: TOOL_DEFINITIONS, tool_choice: "auto", temperature: 0.7, max_tokens: 512 },
         { headers: { Authorization: `Bearer ${GROQ_API_KEY}`, "Content-Type": "application/json" } }
       );
-
       const choice = res.data.choices[0];
       response     = choice.message;
       messages.push(response);
-
       if (!response.tool_calls?.length) break;
-
       for (const tc of response.tool_calls) {
         const args   = JSON.parse(tc.function.arguments || "{}");
         const result = await executeTool(tc.function.name, args, phone);
@@ -268,12 +246,10 @@ async function runAgent(phone, userMessage) {
   }
 
   const finalText = response?.content || "Done.";
-
   if (!chatHistory[phone]) chatHistory[phone] = [];
   chatHistory[phone].push({ role: "user", content: userMessage });
   chatHistory[phone].push({ role: "assistant", content: finalText });
   if (chatHistory[phone].length > MAX_HISTORY * 2) chatHistory[phone] = chatHistory[phone].slice(-MAX_HISTORY * 2);
-
   return finalText;
 }
 
@@ -295,35 +271,50 @@ function buildSessionContext(session) {
 }
 
 // ════════════════════════════════════════════════════════════════════
-//  /ai-fix-callback — PURE GIT OPS
+//  /ai-fix-callback
+//  Fixture sends: { fix: { prTitle, rootCause, explanation, fix: { path, message, content } } }
+//  We unwrap fix.fix to get the actual file patch
 // ════════════════════════════════════════════════════════════════════
 
 app.post("/ai-fix-callback", async (req, res) => {
   try {
-    const incomingSecret  = (req.headers["x-bot-secret"] || req.body.secret || "").trim();
-    const expectedSecret  = (BOT_WEBHOOK_SECRET || "").trim();
+    const incomingSecret = (req.headers["x-bot-secret"] || req.body.secret || "").trim();
+    const expectedSecret = (BOT_WEBHOOK_SECRET || "").trim();
 
-    // ── Debug log — shows first 6 chars of each so we can spot mismatches
-    console.log(`🔐 secret check | incoming: "${incomingSecret.slice(0, 6)}..." | expected: "${expectedSecret.slice(0, 6)}..." | match: ${incomingSecret === expectedSecret}`);
+    console.log(`🔐 secret | incoming: "${incomingSecret.slice(0,6)}..." expected: "${expectedSecret.slice(0,6)}..." match: ${incomingSecret === expectedSecret}`);
 
     if (!incomingSecret || incomingSecret !== expectedSecret) {
-      console.error(`❌ 403 — secret mismatch. incoming length: ${incomingSecret.length}, expected length: ${expectedSecret.length}`);
+      console.error(`❌ 403 — secret mismatch. lengths: ${incomingSecret.length} vs ${expectedSecret.length}`);
       return res.sendStatus(403);
     }
 
-    const { phone, testTitle, testFile, fix, error, runUrl } = req.body;
-    if (!fix?.content || !fix?.path) {
-      console.error("❌ 400 — missing fix.content or fix.path");
+    const { phone, testTitle, runUrl } = req.body;
+
+    // ── Unwrap the nested fix structure from Groq ─────────────────
+    // Groq returns: { prTitle, rootCause, explanation, fix: { path, message, content } }
+    // Fixture sends that whole object as req.body.fix
+    // So the actual file patch is at req.body.fix.fix
+    const groqResult = req.body.fix; // full Groq response object
+    const filePatch  = groqResult?.fix || groqResult; // try .fix first, fallback to root
+
+    console.log(`📦 fix keys: ${Object.keys(groqResult || {}).join(', ')}`);
+    console.log(`📄 filePatch keys: ${Object.keys(filePatch || {}).join(', ')}`);
+
+    if (!filePatch?.content || !filePatch?.path) {
+      console.error(`❌ 400 — missing content or path. filePatch: ${JSON.stringify(filePatch)?.slice(0, 200)}`);
       return res.sendStatus(400);
     }
 
-    res.sendStatus(200);
+    res.sendStatus(200); // ACK immediately
 
-    const session = getSession(phone);
-    const repo    = REPOS[0];
-    const headers = { ...ghHeaders(), "Content-Type": "application/json" };
+    const session    = getSession(phone);
+    const repo       = REPOS[0];
+    const headers    = { ...ghHeaders(), "Content-Type": "application/json" };
+    const prTitle    = groqResult?.prTitle   || `fix: ${testTitle}`;
+    const rootCause  = groqResult?.rootCause || "";
+    const explanation = groqResult?.explanation || "";
 
-    console.log(`\n🤖 Fix callback: "${testTitle}" | file: ${fix.path}`);
+    console.log(`\n🤖 Fix callback: "${testTitle}" | file: ${filePatch.path}`);
 
     const attempt = [...session.fixAttempts].reverse()
       .find((a) => a.testTitle === testTitle && a.status === "pending");
@@ -331,30 +322,37 @@ app.post("/ai-fix-callback", async (req, res) => {
     await send(phone, `🔨 Fix received! Creating PR for "${testTitle}"...`);
 
     try {
+      // Get branch SHA
       const refRes    = await axios.get(`https://api.github.com/repos/${repo.repo}/git/ref/heads/${repo.branch}`, { headers });
       const branchSHA = refRes.data.object.sha;
 
+      // Create fix branch
       const safeName   = testTitle.replace(/[^a-zA-Z0-9]/g, "-").slice(0, 35).toLowerCase();
       const branchName = `ai-fix-${safeName}-${Date.now()}`;
-
       await axios.post(`https://api.github.com/repos/${repo.repo}/git/refs`, { ref: `refs/heads/${branchName}`, sha: branchSHA }, { headers });
 
+      // Commit fixed file
       let existingSha;
       try {
-        const ex = await axios.get(`https://api.github.com/repos/${repo.repo}/contents/${fix.path}?ref=${branchName}`, { headers });
+        const ex = await axios.get(`https://api.github.com/repos/${repo.repo}/contents/${filePatch.path}?ref=${branchName}`, { headers });
         existingSha = ex.data.sha;
       } catch (_) {}
 
-      const commitPayload = { message: fix.message || `fix: ${testTitle}`, content: Buffer.from(fix.content).toString("base64"), branch: branchName };
+      const commitPayload = {
+        message: filePatch.message || `fix: ${testTitle}`,
+        content: Buffer.from(filePatch.content).toString("base64"),
+        branch:  branchName,
+      };
       if (existingSha) commitPayload.sha = existingSha;
-      await axios.put(`https://api.github.com/repos/${repo.repo}/contents/${fix.path}`, commitPayload, { headers });
+      await axios.put(`https://api.github.com/repos/${repo.repo}/contents/${filePatch.path}`, commitPayload, { headers });
 
+      // Open PR
       const attemptNum = attempt?.attemptNumber || 1;
       const prRes = await axios.post(
         `https://api.github.com/repos/${repo.repo}/pulls`,
         {
-          title: fix.prTitle || `fix: ${testTitle} (attempt ${attemptNum})`,
-          body:  `## 🤖 AI Fix — Attempt #${attemptNum}\n\n**Test:** \`${testTitle}\`\n**Root cause:** ${fix.rootCause || "See explanation"}\n**Fix:** ${fix.explanation || ""}\n**File:** \`${fix.path}\`\n${runUrl ? `**Run:** ${runUrl}\n` : ""}\n---\n*Auto-generated by WhatsApp QA Bot 🤖*`,
+          title: prTitle,
+          body:  `## 🤖 AI Fix — Attempt #${attemptNum}\n\n**Test:** \`${testTitle}\`\n**Root cause:** ${rootCause}\n**Fix:** ${explanation}\n**File:** \`${filePatch.path}\`\n${runUrl ? `**Run:** ${runUrl}\n` : ""}\n---\n*Auto-generated by WhatsApp QA Bot 🤖*`,
           head:  branchName,
           base:  repo.branch,
           draft: false,
@@ -362,14 +360,18 @@ app.post("/ai-fix-callback", async (req, res) => {
         { headers }
       );
 
-      if (attempt) { attempt.prNumber = prRes.data.number; attempt.prUrl = prRes.data.html_url; attempt.branch = branchName; attempt.status = "pr_created"; }
+      if (attempt) {
+        attempt.prNumber = prRes.data.number;
+        attempt.prUrl    = prRes.data.html_url;
+        attempt.branch   = branchName;
+        attempt.status   = "pr_created";
+      }
 
       await send(phone,
         `✅ PR #${prRes.data.number} ready for "${testTitle}" (attempt #${attemptNum})\n` +
         `🔗 ${prRes.data.html_url}\n` +
-        `Root cause: ${fix.rootCause || "see PR"}`
+        `Root cause: ${rootCause || "see PR"}`
       );
-
       console.log(`✅ PR #${prRes.data.number}: ${prRes.data.html_url}`);
 
     } catch (err) {
@@ -424,7 +426,7 @@ app.post("/webhook", async (req, res) => {
 app.get("/health", (_req, res) => res.send("ok"));
 
 // ════════════════════════════════════════════════════════════════════
-//  GITHUB HELPERS
+//  HELPERS
 // ════════════════════════════════════════════════════════════════════
 
 function ghHeaders() { return { Authorization: `token ${GITHUB_TOKEN}`, "X-GitHub-Api-Version": "2022-11-28" }; }
@@ -435,7 +437,6 @@ async function loadReport(phone, repo, runId, run) {
     const artRes  = await ghGet(`/repos/${repo.repo}/actions/runs/${runId}/artifacts`);
     const jsonArt = artRes.artifacts.find((a) => a.name === "json-report");
     if (!jsonArt) { getSession(phone).lastRun = { runUrl: run.html_url, conclusion: run.conclusion, summary: null }; return; }
-
     const dlRes = await axios.get(
       `https://api.github.com/repos/${repo.repo}/actions/artifacts/${jsonArt.id}/zip`,
       { headers: { Authorization: `token ${GITHUB_TOKEN}` }, responseType: "arraybuffer", maxRedirects: 5 }
@@ -444,7 +445,6 @@ async function loadReport(phone, repo, runId, run) {
     const zip  = await JSZip.loadAsync(dlRes.data);
     const file = zip.file("playwright-results.json");
     if (!file) return;
-
     const summary = extractSummary(JSON.parse(await file.async("string")));
     getSession(phone).lastRun = { runUrl: run.html_url, conclusion: run.conclusion, summary };
     console.log(`✅ Report: ${summary.passed}p ${summary.failed}f ${summary.skipped}s`);
@@ -456,8 +456,8 @@ function extractSummary(report) {
   function walk(suite) {
     for (const spec of suite.specs || []) {
       for (const test of spec.tests || []) {
-        const status = test.status || test.results?.[0]?.status;
-        const error  = test.results?.[0]?.error?.message || null;
+        const status  = test.status || test.results?.[0]?.status;
+        const error   = test.results?.[0]?.error?.message || null;
         const rawFile = suite.file || spec.file || "";
         const file    = rawFile.replace(/^.*?(tests[\\/])/, 'tests/').replace(/\\/g, '/');
         s.duration   += test.results?.[0]?.duration || 0;
