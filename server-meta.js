@@ -178,7 +178,6 @@ async function executeTool(name, args, phone) {
     session.activeFix = { testTitle: testToFix.title, testFile: testToFix.file, attemptNumber };
 
     try {
-      // Pass original_error from first run — fixture uses it for richer Groq context
       const originalError = (testToFix.error || "").slice(0, 500);
 
       await axios.post(
@@ -189,7 +188,7 @@ async function executeTool(name, args, phone) {
             test_file:      testToFix.file || "tests/",
             test_title:     testToFix.title,
             phone_number:   phone,
-            original_error: originalError,   // ← from JSON report, first run
+            original_error: originalError,
           },
         },
         { headers: ghHeaders() }
@@ -297,17 +296,24 @@ function buildSessionContext(session) {
 
 // ════════════════════════════════════════════════════════════════════
 //  /ai-fix-callback — PURE GIT OPS
-//  Fixture already called Groq. This just: branch → commit → PR → notify
 // ════════════════════════════════════════════════════════════════════
 
 app.post("/ai-fix-callback", async (req, res) => {
   try {
-    const secret = req.headers["x-bot-secret"] || req.body.secret;
-    if (secret !== BOT_WEBHOOK_SECRET) return res.sendStatus(403);
+    const incomingSecret  = (req.headers["x-bot-secret"] || req.body.secret || "").trim();
+    const expectedSecret  = (BOT_WEBHOOK_SECRET || "").trim();
+
+    // ── Debug log — shows first 6 chars of each so we can spot mismatches
+    console.log(`🔐 secret check | incoming: "${incomingSecret.slice(0, 6)}..." | expected: "${expectedSecret.slice(0, 6)}..." | match: ${incomingSecret === expectedSecret}`);
+
+    if (!incomingSecret || incomingSecret !== expectedSecret) {
+      console.error(`❌ 403 — secret mismatch. incoming length: ${incomingSecret.length}, expected length: ${expectedSecret.length}`);
+      return res.sendStatus(403);
+    }
 
     const { phone, testTitle, testFile, fix, error, runUrl } = req.body;
     if (!fix?.content || !fix?.path) {
-      console.error("❌ ai-fix-callback: missing fix.content or fix.path");
+      console.error("❌ 400 — missing fix.content or fix.path");
       return res.sendStatus(400);
     }
 
@@ -364,10 +370,12 @@ app.post("/ai-fix-callback", async (req, res) => {
         `Root cause: ${fix.rootCause || "see PR"}`
       );
 
+      console.log(`✅ PR #${prRes.data.number}: ${prRes.data.html_url}`);
+
     } catch (err) {
       console.error("❌ Git ops:", err.response?.data?.message || err.message);
       if (attempt) attempt.status = "failed";
-      await send(phone, `❌ PR creation failed for "${testTitle}": ${err.response?.data?.message || err.message}`);
+      await send(phone, `❌ PR creation failed: ${err.response?.data?.message || err.message}`);
     }
   } catch (err) {
     console.error("❌ ai-fix-callback:", err.message);
@@ -450,7 +458,6 @@ function extractSummary(report) {
       for (const test of spec.tests || []) {
         const status = test.status || test.results?.[0]?.status;
         const error  = test.results?.[0]?.error?.message || null;
-        // Normalize file path — strip absolute prefix, keep tests/...
         const rawFile = suite.file || spec.file || "";
         const file    = rawFile.replace(/^.*?(tests[\\/])/, 'tests/').replace(/\\/g, '/');
         s.duration   += test.results?.[0]?.duration || 0;
