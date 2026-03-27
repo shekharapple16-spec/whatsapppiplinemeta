@@ -32,22 +32,10 @@ const REPOS = [
 
 // ════════════════════════════════════════════════════════════════════
 //  SESSION STATE — RAM only, per phone, current session
-//
-//  sessionState[phone] = {
-//    lastRun: { runUrl, conclusion, summary: { failedTests[{title,file,error}] } }
-//    fixAttempts: [{ attemptNumber, testTitle, testFile, prNumber, prUrl, branch, status, triggeredAt }]
-//    activeFix: { testTitle, testFile, attemptNumber }   ← pointer to latest
-//  }
-//
-//  Rules:
-//  - run_tests   → writes lastRun only
-//  - fix_test    → reads lastRun, appends fixAttempts, updates activeFix
-//  - /ai-fix-callback → updates fixAttempts[n].prNumber + status
-//  - No persistence — server restart = clean slate, user reruns tests
 // ════════════════════════════════════════════════════════════════════
 
-const sessionState = {}; // { phone: { lastRun, fixAttempts, activeFix } }
-const chatHistory  = {}; // { phone: [{role, content}] }
+const sessionState = {};
+const chatHistory  = {};
 const MAX_HISTORY  = 10;
 
 function getSession(phone) {
@@ -71,12 +59,11 @@ function isDuplicate(msgId) {
   return false;
 }
 
-// ─── Action keywords → show "⚙️ Ok mere Aakaa..." ack ────────────
+// ─── Action keywords → "⚙️ Ok mere Aakaa..." ack ─────────────────
 const ACTION_KEYWORDS = ["run test", "execute test", "trigger test", "runtests", "fix this", "fix test", "retry fix", "fix again"];
 
 function isActionMessage(text) {
-  const lower = text.toLowerCase();
-  return ACTION_KEYWORDS.some((kw) => lower.includes(kw));
+  return ACTION_KEYWORDS.some((kw) => text.toLowerCase().includes(kw));
 }
 
 // ════════════════════════════════════════════════════════════════════
@@ -102,13 +89,14 @@ const TOOL_DEFINITIONS = [
     function: {
       name: "fix_test",
       description:
-        "Trigger an AI fix for a failing test. Dispatches ai-fix.yml which runs the test, " +
-        "the Playwright fixture captures live DOM + error, calls Groq, and POSTs the fix back. " +
-        "Use when user says 'fix this', 'fix test', 'retry fix', 'fix again'.",
+        "Trigger an AI fix for a failing test. Dispatches ai-fix.yml which re-runs the test, " +
+        "the Playwright fixture captures live DOM + error at failure moment, calls Groq with " +
+        "Playwright best practices knowledge, and POSTs the fix back. " +
+        "Use when user says 'fix this', 'fix test', 'retry fix', 'fix again', or 'fix failed tc'.",
       parameters: {
         type: "object",
         properties: {
-          test_title: { type: "string", description: "Exact title of the failing test to fix. If not specified, fix the first failing test from last run." },
+          test_title: { type: "string", description: "Title of the failing test to fix. If not specified, fix the first failing test from last run." },
           repo_id:    { type: "number", description: "Repo ID. Default 1." },
         },
       },
@@ -166,44 +154,42 @@ async function executeTool(name, args, phone) {
 
   // ── fix_test ───────────────────────────────────────────────────
   if (name === "fix_test") {
-    // Guard: must have run results in this session
     if (!session.lastRun?.summary?.failedTests?.length) {
       return "No failed tests in memory. Please run tests first 🙏";
     }
 
-    // Resolve which test to fix
-    const failedTests  = session.lastRun.summary.failedTests;
-    const targetTitle  = args.test_title?.trim();
-    const testToFix    = targetTitle
+    const failedTests = session.lastRun.summary.failedTests;
+    const targetTitle = args.test_title?.trim();
+    const testToFix   = targetTitle
       ? failedTests.find((t) => t.title.toLowerCase().includes(targetTitle.toLowerCase())) || failedTests[0]
       : failedTests[0];
 
     const attemptNumber = session.fixAttempts.filter((a) => a.testTitle === testToFix.title).length + 1;
 
-    // Track this attempt immediately
     const attempt = {
       attemptNumber,
       testTitle:   testToFix.title,
       testFile:    testToFix.file || "tests/",
-      prNumber:    null,
-      prUrl:       null,
-      branch:      null,
-      status:      "pending",       // pending → pr_created → verified_pass / verified_fail
+      prNumber:    null, prUrl: null, branch: null,
+      status:      "pending",
       triggeredAt: Date.now(),
     };
     session.fixAttempts.push(attempt);
     session.activeFix = { testTitle: testToFix.title, testFile: testToFix.file, attemptNumber };
 
     try {
-      // Dispatch ai-fix.yml — fixture does all AI work, POSTs fix back
+      // Pass original_error from first run — fixture uses it for richer Groq context
+      const originalError = (testToFix.error || "").slice(0, 500);
+
       await axios.post(
         `https://api.github.com/repos/${repo.repo}/actions/workflows/${repo.aiFixWorkflow}/dispatches`,
         {
           ref:    repo.branch,
           inputs: {
-            test_file:    testToFix.file || "tests/",
-            test_title:   testToFix.title,
-            phone_number: phone,
+            test_file:      testToFix.file || "tests/",
+            test_title:     testToFix.title,
+            phone_number:   phone,
+            original_error: originalError,   // ← from JSON report, first run
           },
         },
         { headers: ghHeaders() }
@@ -212,11 +198,10 @@ async function executeTool(name, args, phone) {
       const isRetry = attemptNumber > 1;
       return (
         `${isRetry ? `🔄 Retry #${attemptNumber}` : "🔧 Fix"} triggered for "${testToFix.title}"\n` +
-        `Playwright is running the test, capturing live DOM + error...\n` +
-        `PR will be sent automatically when ready (~2-3 min) ⏳`
+        `Playwright running test → capturing live DOM + error → Groq fixing with best practices...\n` +
+        `PR will arrive in ~2-3 min ⏳`
       );
     } catch (err) {
-      // Remove the attempt if dispatch failed
       session.fixAttempts.pop();
       session.activeFix = null;
       return `Failed to trigger fix: ${err.message}`;
@@ -233,8 +218,6 @@ async function executeTool(name, args, phone) {
 async function runAgent(phone, userMessage) {
   const history = chatHistory[phone] || [];
   const session = getSession(phone);
-
-  // Build dynamic session context for Groq — only what's relevant
   const sessionCtx = buildSessionContext(session);
 
   const messages = [
@@ -245,13 +228,12 @@ async function runAgent(phone, userMessage) {
         `AVAILABLE REPOS: ${REPOS.map((r) => `${r.id}. ${r.name} (${r.repo})`).join(", ")}\n\n` +
         (sessionCtx ? `CURRENT SESSION STATE:\n${sessionCtx}\n\n` : "") +
         `RULES:\n` +
-        `- Greet naturally, chat normally for casual messages\n` +
+        `- Greet naturally for casual messages\n` +
         `- "run tests" / "execute tests" / "trigger tests" → call run_tests immediately\n` +
-        `- "fix this" / "fix test" / "retry" / "fix again" → call fix_test immediately\n` +
-        `- If user asks "what failed?" / "show failures" → answer from session state, no tool needed\n` +
-        `- If user asks about fix attempts / PR status → answer from session state, no tool needed\n` +
-        `- repo_id defaults to 1. Be factual, max 3 lines for results.\n` +
-        `- NEVER say you can only run tests — you are a full QA assistant`,
+        `- "fix this" / "fix test" / "fix failed tc" / "retry" / "fix again" → call fix_test immediately\n` +
+        `- "what failed?" / "show failures" → answer from session state, no tool\n` +
+        `- "fix attempts" / "PR status" → answer from session state, no tool\n` +
+        `- repo_id defaults to 1. Be factual, max 3 lines for results.`,
     },
     ...history,
     { role: "user", content: userMessage },
@@ -263,14 +245,7 @@ async function runAgent(phone, userMessage) {
     try {
       const res = await axios.post(
         GROQ_URL,
-        {
-          model:       GROQ_MODEL,
-          messages,
-          tools:       TOOL_DEFINITIONS,
-          tool_choice: "auto",
-          temperature: 0.7,
-          max_tokens:  512,
-        },
+        { model: GROQ_MODEL, messages, tools: TOOL_DEFINITIONS, tool_choice: "auto", temperature: 0.7, max_tokens: 512 },
         { headers: { Authorization: `Bearer ${GROQ_API_KEY}`, "Content-Type": "application/json" } }
       );
 
@@ -298,18 +273,13 @@ async function runAgent(phone, userMessage) {
   if (!chatHistory[phone]) chatHistory[phone] = [];
   chatHistory[phone].push({ role: "user", content: userMessage });
   chatHistory[phone].push({ role: "assistant", content: finalText });
-  if (chatHistory[phone].length > MAX_HISTORY * 2) {
-    chatHistory[phone] = chatHistory[phone].slice(-MAX_HISTORY * 2);
-  }
+  if (chatHistory[phone].length > MAX_HISTORY * 2) chatHistory[phone] = chatHistory[phone].slice(-MAX_HISTORY * 2);
 
   return finalText;
 }
 
-// Build a compact session context string for Groq system prompt
-// Only included when there's actual state — never adds noise for casual chat
 function buildSessionContext(session) {
   const parts = [];
-
   if (session.lastRun?.summary) {
     const s = session.lastRun.summary;
     parts.push(
@@ -317,27 +287,21 @@ function buildSessionContext(session) {
       (s.failedTests?.length ? ` | Failed: ${s.failedTests.map((t) => `"${t.title}"`).join(", ")}` : "")
     );
   }
-
   if (session.fixAttempts.length) {
-    const attempts = session.fixAttempts.map((a) =>
-      `Attempt #${a.attemptNumber} for "${a.testTitle}" → status: ${a.status}` +
-      (a.prNumber ? ` | PR #${a.prNumber}: ${a.prUrl}` : " | PR pending")
-    );
-    parts.push(`Fix attempts this session:\n${attempts.join("\n")}`);
+    parts.push(`Fix attempts:\n${session.fixAttempts.map((a) =>
+      `  #${a.attemptNumber} "${a.testTitle}" → ${a.status}${a.prNumber ? ` PR#${a.prNumber}: ${a.prUrl}` : ""}`
+    ).join("\n")}`);
   }
-
   return parts.join("\n");
 }
 
 // ════════════════════════════════════════════════════════════════════
 //  /ai-fix-callback — PURE GIT OPS
-//  Fixture already called Groq and generated the fix.
-//  This endpoint just: creates branch → commits fix → opens PR → notifies user
+//  Fixture already called Groq. This just: branch → commit → PR → notify
 // ════════════════════════════════════════════════════════════════════
 
 app.post("/ai-fix-callback", async (req, res) => {
   try {
-    // Validate secret
     const secret = req.headers["x-bot-secret"] || req.body.secret;
     if (secret !== BOT_WEBHOOK_SECRET) return res.sendStatus(403);
 
@@ -347,7 +311,7 @@ app.post("/ai-fix-callback", async (req, res) => {
       return res.sendStatus(400);
     }
 
-    res.sendStatus(200); // ACK immediately
+    res.sendStatus(200);
 
     const session = getSession(phone);
     const repo    = REPOS[0];
@@ -355,70 +319,36 @@ app.post("/ai-fix-callback", async (req, res) => {
 
     console.log(`\n🤖 Fix callback: "${testTitle}" | file: ${fix.path}`);
 
-    // Find the pending attempt for this test
-    const attempt = [...session.fixAttempts]
-      .reverse()
+    const attempt = [...session.fixAttempts].reverse()
       .find((a) => a.testTitle === testTitle && a.status === "pending");
 
     await send(phone, `🔨 Fix received! Creating PR for "${testTitle}"...`);
 
     try {
-      // 1. Get current branch SHA
-      const refRes    = await axios.get(
-        `https://api.github.com/repos/${repo.repo}/git/ref/heads/${repo.branch}`,
-        { headers }
-      );
+      const refRes    = await axios.get(`https://api.github.com/repos/${repo.repo}/git/ref/heads/${repo.branch}`, { headers });
       const branchSHA = refRes.data.object.sha;
 
-      // 2. Create fix branch
       const safeName   = testTitle.replace(/[^a-zA-Z0-9]/g, "-").slice(0, 35).toLowerCase();
       const branchName = `ai-fix-${safeName}-${Date.now()}`;
 
-      await axios.post(
-        `https://api.github.com/repos/${repo.repo}/git/refs`,
-        { ref: `refs/heads/${branchName}`, sha: branchSHA },
-        { headers }
-      );
+      await axios.post(`https://api.github.com/repos/${repo.repo}/git/refs`, { ref: `refs/heads/${branchName}`, sha: branchSHA }, { headers });
 
-      // 3. Commit the fixed file
       let existingSha;
       try {
-        const ex = await axios.get(
-          `https://api.github.com/repos/${repo.repo}/contents/${fix.path}?ref=${branchName}`,
-          { headers }
-        );
+        const ex = await axios.get(`https://api.github.com/repos/${repo.repo}/contents/${fix.path}?ref=${branchName}`, { headers });
         existingSha = ex.data.sha;
       } catch (_) {}
 
-      const commitPayload = {
-        message: fix.message || `fix: ${testTitle}`,
-        content: Buffer.from(fix.content).toString("base64"),
-        branch:  branchName,
-      };
+      const commitPayload = { message: fix.message || `fix: ${testTitle}`, content: Buffer.from(fix.content).toString("base64"), branch: branchName };
       if (existingSha) commitPayload.sha = existingSha;
+      await axios.put(`https://api.github.com/repos/${repo.repo}/contents/${fix.path}`, commitPayload, { headers });
 
-      await axios.put(
-        `https://api.github.com/repos/${repo.repo}/contents/${fix.path}`,
-        commitPayload,
-        { headers }
-      );
-
-      // 4. Open PR
       const attemptNum = attempt?.attemptNumber || 1;
-      const prBody =
-        `## 🤖 AI Fix — Attempt #${attemptNum}\n\n` +
-        `**Test:** \`${testTitle}\`\n` +
-        `**Root cause:** ${fix.rootCause || "See explanation"}\n` +
-        `**Fix:** ${fix.explanation || ""}\n` +
-        `**File:** \`${fix.path}\`\n` +
-        (runUrl ? `**Run:** ${runUrl}\n` : "") +
-        `\n---\n*Auto-generated by WhatsApp QA Bot 🤖*`;
-
       const prRes = await axios.post(
         `https://api.github.com/repos/${repo.repo}/pulls`,
         {
           title: fix.prTitle || `fix: ${testTitle} (attempt ${attemptNum})`,
-          body:  prBody,
+          body:  `## 🤖 AI Fix — Attempt #${attemptNum}\n\n**Test:** \`${testTitle}\`\n**Root cause:** ${fix.rootCause || "See explanation"}\n**Fix:** ${fix.explanation || ""}\n**File:** \`${fix.path}\`\n${runUrl ? `**Run:** ${runUrl}\n` : ""}\n---\n*Auto-generated by WhatsApp QA Bot 🤖*`,
           head:  branchName,
           base:  repo.branch,
           draft: false,
@@ -426,37 +356,26 @@ app.post("/ai-fix-callback", async (req, res) => {
         { headers }
       );
 
-      // 5. Update session state
-      if (attempt) {
-        attempt.prNumber = prRes.data.number;
-        attempt.prUrl    = prRes.data.html_url;
-        attempt.branch   = branchName;
-        attempt.status   = "pr_created";
-      }
+      if (attempt) { attempt.prNumber = prRes.data.number; attempt.prUrl = prRes.data.html_url; attempt.branch = branchName; attempt.status = "pr_created"; }
 
-      // 6. Notify user
-      await send(
-        phone,
-        `✅ PR #${prRes.data.number} created for "${testTitle}" (attempt #${attemptNum})\n` +
+      await send(phone,
+        `✅ PR #${prRes.data.number} ready for "${testTitle}" (attempt #${attemptNum})\n` +
         `🔗 ${prRes.data.html_url}\n` +
         `Root cause: ${fix.rootCause || "see PR"}`
       );
 
-      console.log(`✅ PR #${prRes.data.number}: ${prRes.data.html_url}`);
-
     } catch (err) {
-      console.error("❌ Git ops failed:", err.response?.data?.message || err.message);
+      console.error("❌ Git ops:", err.response?.data?.message || err.message);
       if (attempt) attempt.status = "failed";
-      await send(phone, `❌ Could not create PR for "${testTitle}": ${err.response?.data?.message || err.message}`);
+      await send(phone, `❌ PR creation failed for "${testTitle}": ${err.response?.data?.message || err.message}`);
     }
-
   } catch (err) {
     console.error("❌ ai-fix-callback:", err.message);
   }
 });
 
 // ════════════════════════════════════════════════════════════════════
-//  WEBHOOK — Meta WhatsApp
+//  WEBHOOK
 // ════════════════════════════════════════════════════════════════════
 
 app.get("/webhook", (req, res) => {
@@ -474,25 +393,17 @@ app.post("/webhook", async (req, res) => {
       const messageBody = msg.text?.body;
       const msgId       = msg.id;
 
-      res.sendStatus(200); // ACK Meta immediately
-
+      res.sendStatus(200);
       if (!messageBody) return;
 
-      if (isDuplicate(msgId)) {
-        console.log(`⚠️  Duplicate msgId ${msgId} — ignored`);
-        return;
-      }
-
+      if (isDuplicate(msgId)) { console.log(`⚠️  Dup ${msgId} — ignored`); return; }
       console.log(`📱 [${fromPhone}] (${msgId}): ${messageBody}`);
 
-      if (isActionMessage(messageBody)) {
-        await send(fromPhone, "⚙️ Ok mere Aakaa...");
-      }
+      if (isActionMessage(messageBody)) await send(fromPhone, "⚙️ Ok mere Aakaa...");
 
       runAgent(fromPhone, messageBody.trim())
         .then((reply) => send(fromPhone, reply))
         .catch((err)  => console.error("❌ Agent error:", err.message));
-
     } else {
       res.sendStatus(200);
     }
@@ -508,53 +419,41 @@ app.get("/health", (_req, res) => res.send("ok"));
 //  GITHUB HELPERS
 // ════════════════════════════════════════════════════════════════════
 
-function ghHeaders() {
-  return { Authorization: `token ${GITHUB_TOKEN}`, "X-GitHub-Api-Version": "2022-11-28" };
-}
-
-async function ghGet(path) {
-  const res = await axios.get(`https://api.github.com${path}`, { headers: ghHeaders() });
-  return res.data;
-}
+function ghHeaders() { return { Authorization: `token ${GITHUB_TOKEN}`, "X-GitHub-Api-Version": "2022-11-28" }; }
+async function ghGet(path) { return (await axios.get(`https://api.github.com${path}`, { headers: ghHeaders() })).data; }
 
 async function loadReport(phone, repo, runId, run) {
   try {
     const artRes  = await ghGet(`/repos/${repo.repo}/actions/runs/${runId}/artifacts`);
     const jsonArt = artRes.artifacts.find((a) => a.name === "json-report");
-
-    if (!jsonArt) {
-      getSession(phone).lastRun = { runUrl: run.html_url, conclusion: run.conclusion, summary: null };
-      return;
-    }
+    if (!jsonArt) { getSession(phone).lastRun = { runUrl: run.html_url, conclusion: run.conclusion, summary: null }; return; }
 
     const dlRes = await axios.get(
       `https://api.github.com/repos/${repo.repo}/actions/artifacts/${jsonArt.id}/zip`,
       { headers: { Authorization: `token ${GITHUB_TOKEN}` }, responseType: "arraybuffer", maxRedirects: 5 }
     );
-
     const { default: JSZip } = await import("jszip");
-    const zip     = await JSZip.loadAsync(dlRes.data);
-    const file    = zip.file("playwright-results.json");
+    const zip  = await JSZip.loadAsync(dlRes.data);
+    const file = zip.file("playwright-results.json");
     if (!file) return;
 
     const summary = extractSummary(JSON.parse(await file.async("string")));
     getSession(phone).lastRun = { runUrl: run.html_url, conclusion: run.conclusion, summary };
     console.log(`✅ Report: ${summary.passed}p ${summary.failed}f ${summary.skipped}s`);
-  } catch (err) {
-    console.error("❌ loadReport:", err.message);
-  }
+  } catch (err) { console.error("❌ loadReport:", err.message); }
 }
 
 function extractSummary(report) {
   const s = { passed: 0, failed: 0, skipped: 0, total: 0, duration: 0, failedTests: [], passedTests: [], skippedTests: [] };
-
   function walk(suite) {
     for (const spec of suite.specs || []) {
       for (const test of spec.tests || []) {
         const status = test.status || test.results?.[0]?.status;
         const error  = test.results?.[0]?.error?.message || null;
-        const file   = suite.file || spec.file || "";
-        s.duration  += test.results?.[0]?.duration || 0;
+        // Normalize file path — strip absolute prefix, keep tests/...
+        const rawFile = suite.file || spec.file || "";
+        const file    = rawFile.replace(/^.*?(tests[\\/])/, 'tests/').replace(/\\/g, '/');
+        s.duration   += test.results?.[0]?.duration || 0;
         if (status === "passed"  || status === "expected")       { s.passed++;  s.passedTests.push({ title: spec.title }); }
         else if (status === "failed" || status === "unexpected") { s.failed++;  s.failedTests.push({ title: spec.title, file, error }); }
         else if (status === "skipped" || status === "pending")   { s.skipped++; s.skippedTests.push({ title: spec.title }); }
@@ -562,16 +461,11 @@ function extractSummary(report) {
     }
     for (const child of suite.suites || []) walk(child);
   }
-
   for (const suite of report.suites || []) walk(suite);
   s.total    = s.passed + s.failed + s.skipped;
   s.duration = Math.round(s.duration / 1000);
   return s;
 }
-
-// ════════════════════════════════════════════════════════════════════
-//  WHATSAPP SEND
-// ════════════════════════════════════════════════════════════════════
 
 async function send(toPhone, message) {
   try {
@@ -580,12 +474,10 @@ async function send(toPhone, message) {
       { messaging_product: "whatsapp", to: toPhone, type: "text", text: { body: message } },
       { headers: { Authorization: `Bearer ${META_API_TOKEN}`, "Content-Type": "application/json" } }
     );
-  } catch (err) {
-    console.error("❌ WhatsApp send:", err.response?.data || err.message);
-  }
+  } catch (err) { console.error("❌ Send:", err.response?.data || err.message); }
 }
 
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
+app.listen(PORT, () => console.log(`✅ Server on port ${PORT}`));
