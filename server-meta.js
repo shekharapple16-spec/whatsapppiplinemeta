@@ -14,7 +14,7 @@ const META_API_TOKEN       = process.env.META_API_TOKEN;
 const WEBHOOK_VERIFY_TOKEN = process.env.WEBHOOK_VERIFY_TOKEN;
 const GITHUB_TOKEN         = process.env.GITHUB_TOKEN;
 const GROQ_API_KEY         = process.env.GROQ_API_KEY;
-const BOT_WEBHOOK_SECRET   = process.env.BOT_SECRET; // ← correct env var name
+const BOT_WEBHOOK_SECRET   = process.env.BOT_SECRET;
 
 const GROQ_URL   = "https://api.groq.com/openai/v1/chat/completions";
 const GROQ_MODEL = "openai/gpt-oss-120b";
@@ -65,16 +65,90 @@ function isActionMessage(text) {
   return ACTION_KEYWORDS.some((kw) => text.toLowerCase().includes(kw));
 }
 
-// ─── Secret validator (shared across callbacks) ───────────────────
+// ─── Secret validator ─────────────────────────────────────────────
 function validateSecret(req, res) {
   const incoming = (req.headers["x-bot-secret"] || req.body.secret || "").trim();
   const expected = (BOT_WEBHOOK_SECRET || "").trim();
   if (!incoming || incoming !== expected) {
-    console.error(`❌ 403 — secret mismatch. lengths: ${incoming.length} vs ${expected.length}`);
+    console.error(`❌ 403 — secret mismatch`);
     res.sendStatus(403);
     return false;
   }
   return true;
+}
+
+// ════════════════════════════════════════════════════════════════════
+//  PR CHECK POLLER
+//  Polls GitHub PR check runs every 30s after PR is created.
+//  No playwright.yml changes needed — server does the polling itself.
+// ════════════════════════════════════════════════════════════════════
+
+async function pollPrChecks(phone, prNumber, prUrl, testTitle, attempt) {
+  const repo = REPOS[0];
+  console.log(`🔄 Polling PR #${prNumber} checks...`);
+
+  // Wait for checks to start (give GitHub Actions ~30s to queue)
+  await sleep(30000);
+
+  let pollAttempt = 0;
+  const maxAttempts = 20; // 20 × 30s = 10 min max
+
+  while (pollAttempt < maxAttempts) {
+    await sleep(30000);
+    pollAttempt++;
+
+    try {
+      const res = await ghGet(`/repos/${repo.repo}/pulls/${prNumber}`);
+      const headSha = res.head.sha;
+
+      // Get check runs for the PR head commit
+      const checks = await ghGet(`/repos/${repo.repo}/commits/${headSha}/check-runs`);
+      const runs   = checks.check_runs || [];
+
+      if (!runs.length) {
+        console.log(`⏳ PR #${prNumber} [${pollAttempt}]: no checks yet`);
+        continue;
+      }
+
+      const allDone = runs.every((r) => r.status === "completed");
+      if (!allDone) {
+        console.log(`⏳ PR #${prNumber} [${pollAttempt}]: ${runs.filter(r => r.status !== "completed").length} checks still running`);
+        continue;
+      }
+
+      // All checks completed — determine overall result
+      const allPassed = runs.every((r) => r.conclusion === "success" || r.conclusion === "skipped" || r.conclusion === "neutral");
+      const failed    = runs.filter((r) => r.conclusion !== "success" && r.conclusion !== "skipped" && r.conclusion !== "neutral");
+
+      if (attempt) {
+        attempt.status = allPassed ? "verified_pass" : "verified_fail";
+      }
+
+      if (allPassed) {
+        await send(phone,
+          `✅ PR #${prNumber} tests PASSED for "${testTitle}"!\n` +
+          `🔗 ${prUrl}\n` +
+          `Safe to merge 🎉`
+        );
+        console.log(`✅ PR #${prNumber} passed`);
+      } else {
+        await send(phone,
+          `❌ PR #${prNumber} tests FAILED for "${testTitle}"\n` +
+          `Failed checks: ${failed.map(r => r.name).join(", ")}\n` +
+          `🔗 ${prUrl}\n` +
+          `Say "fix this" to retry with another fix attempt.`
+        );
+        console.log(`❌ PR #${prNumber} failed`);
+      }
+      return;
+
+    } catch (err) {
+      console.error(`❌ Poll PR #${prNumber} error:`, err.message);
+    }
+  }
+
+  // Timed out
+  await send(phone, `⚠️ PR #${prNumber} checks took too long. Check manually: ${prUrl}`);
 }
 
 // ════════════════════════════════════════════════════════════════════
@@ -283,8 +357,7 @@ function buildSessionContext(session) {
 }
 
 // ════════════════════════════════════════════════════════════════════
-//  /ai-fix-callback — receives fix from fixture, does git ops
-//  Structure: req.body.fix = { prTitle, rootCause, explanation, fix: { path, message, content } }
+//  /ai-fix-callback — git ops + kick off PR polling
 // ════════════════════════════════════════════════════════════════════
 
 app.post("/ai-fix-callback", async (req, res) => {
@@ -292,14 +365,14 @@ app.post("/ai-fix-callback", async (req, res) => {
     if (!validateSecret(req, res)) return;
 
     const { phone, testTitle, runUrl } = req.body;
-    const groqResult = req.body.fix;
-    const filePatch  = groqResult?.fix || groqResult; // unwrap nested .fix
+    const groqResult  = req.body.fix;
+    const filePatch   = groqResult?.fix || groqResult;
 
     console.log(`📦 fix keys: ${Object.keys(groqResult || {}).join(", ")}`);
     console.log(`📄 filePatch keys: ${Object.keys(filePatch || {}).join(", ")}`);
 
     if (!filePatch?.content || !filePatch?.path) {
-      console.error(`❌ 400 — missing content/path. filePatch: ${JSON.stringify(filePatch)?.slice(0, 200)}`);
+      console.error(`❌ 400 — missing content/path`);
       return res.sendStatus(400);
     }
 
@@ -320,9 +393,9 @@ app.post("/ai-fix-callback", async (req, res) => {
     await send(phone, `🔨 Fix received! Creating PR for "${testTitle}"...`);
 
     try {
-      const refRes    = await axios.get(`https://api.github.com/repos/${repo.repo}/git/ref/heads/${repo.branch}`, { headers });
-      const branchSHA = refRes.data.object.sha;
-      const safeName  = testTitle.replace(/[^a-zA-Z0-9]/g, "-").slice(0, 35).toLowerCase();
+      const refRes     = await axios.get(`https://api.github.com/repos/${repo.repo}/git/ref/heads/${repo.branch}`, { headers });
+      const branchSHA  = refRes.data.object.sha;
+      const safeName   = testTitle.replace(/[^a-zA-Z0-9]/g, "-").slice(0, 35).toLowerCase();
       const branchName = `ai-fix-${safeName}-${Date.now()}`;
 
       await axios.post(`https://api.github.com/repos/${repo.repo}/git/refs`,
@@ -366,9 +439,13 @@ app.post("/ai-fix-callback", async (req, res) => {
         `✅ PR #${prRes.data.number} created for "${testTitle}" (attempt #${attemptNum})\n` +
         `🔗 ${prRes.data.html_url}\n` +
         `Root cause: ${rootCause || "see PR"}\n` +
-        `Tests will run automatically on the PR. You'll be notified of the result.`
+        `⏳ Waiting for PR checks... will notify you automatically.`
       );
       console.log(`✅ PR #${prRes.data.number}: ${prRes.data.html_url}`);
+
+      // ── Poll PR checks async — no playwright.yml changes needed ──
+      pollPrChecks(phone, prRes.data.number, prRes.data.html_url, testTitle, attempt)
+        .catch((err) => console.error("❌ pollPrChecks:", err.message));
 
     } catch (err) {
       console.error("❌ Git ops:", err.response?.data?.message || err.message);
@@ -381,37 +458,7 @@ app.post("/ai-fix-callback", async (req, res) => {
 });
 
 // ════════════════════════════════════════════════════════════════════
-//  /pr-result — called by playwright.yml after PR tests complete
-//  Notifies user on WhatsApp whether the fix passed or failed
-// ════════════════════════════════════════════════════════════════════
-
-app.post("/pr-result", async (req, res) => {
-  try {
-    if (!validateSecret(req, res)) return;
-    res.sendStatus(200);
-
-    const { prNumber, status, message } = req.body;
-    console.log(`\n📊 PR #${prNumber} result: ${status}`);
-
-    // Find which phone number owns this PR across all sessions
-    for (const [phone, session] of Object.entries(sessionState)) {
-      const attempt = session.fixAttempts.find((a) => a.prNumber === prNumber);
-      if (attempt) {
-        attempt.status = status === "success" ? "verified_pass" : "verified_fail";
-        await send(phone, message);
-        console.log(`✅ Notified ${phone} about PR #${prNumber} result`);
-        return;
-      }
-    }
-
-    console.log(`⚠️  No session found for PR #${prNumber} — user not notified`);
-  } catch (err) {
-    console.error("❌ pr-result:", err.message);
-  }
-});
-
-// ════════════════════════════════════════════════════════════════════
-//  WEBHOOK — Meta WhatsApp
+//  WEBHOOK
 // ════════════════════════════════════════════════════════════════════
 
 app.get("/webhook", (req, res) => {
